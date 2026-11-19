@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-L", "native=C:\\Users\\hong\\AppData\\Local\\cargo-xwin\\windows-msvc-sysroot\\windows-msvc-sysroot\\lib\\x86_64-unknown-windows-msvc",
+]

@@ -1,0 +1,38 @@
+[engine]
+dry_run = true
+wal_dir = "data/wal"
+log_level = "info"
+
+[strategy]
+symbol_hl = "xyz:SKHY"
+symbol_bn = "SKHYUSDT"
+entry_spread_bps = 50.0
+exit_spread_bps = 10.0
+order_chunk_qty = 10.0
+max_position_qty = 100.0
+hl_slippage_bps = 10.0
+hl_tick_size = 0.01
+hl_step_size = 0.1
+bn_step_size = 0.1
+roundtrip_fees_bps = 12.0
+
+[risk]
+max_position_qty = 100.0
+max_order_chunk_qty = 10.0
+max_unhedged_qty = 1.0
+max_drawdown_usdt = 500.0
+max_consecutive_failures = 3
+cooldown_ms = 1000
+
+[venues.binance]
+api_key = "ENV_BINANCE_API_KEY"
+api_secret = "ENV_BINANCE_API_SECRET"
+rest_url = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com/ws"
+
+[venues.hyperliquid]
+private_key = "ENV_HL_PRIVATE_KEY"
+wallet_address = "ENV_HL_WALLET_ADDRESS"
+rest_url = "https://api.hyperliquid.xyz"
+ws_url = "wss://api.hyperliquid.xyz/ws"
+is_mainnet = true
