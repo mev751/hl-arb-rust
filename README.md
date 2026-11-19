@@ -1,6 +1,6 @@
 # Nautilus Arbitrage Engine (`nautilus_arb`)
 
-High-performance, institutional-grade cross-venue arbitrage engine written in **Rust**, architected around **NautilusTrader 2.0** design principles and porting the production-tested trading, WAL, and risk mechanics from `D:\hedg-arb`.
+High-performance, institutional-grade cross-venue arbitrage engine written in **Rust**, architected around **NautilusTrader 2.0** design principles and porting the production-tested trading, WAL, and risk mechanics from `hedg-arb`.
 
 ---
 
