@@ -46,9 +46,32 @@ impl<E: ExecutionClient> ArbitrageEngine<E> {
         self.strategy.state()
     }
 
+    pub fn snapshot(&self) -> &EngineSnapshot {
+        &self.snapshot
+    }
+
     pub fn set_state(&mut self, state: StrategyState) {
         self.strategy.set_state(state);
         self.snapshot.state = state;
+    }
+
+    /// Trigger a test trade for a specified quantity (size) across both legs.
+    pub async fn trigger_test_order(
+        &mut self,
+        size: Decimal,
+        hl_limit_price: Decimal,
+    ) -> Result<(), anyhow::Error> {
+        let session_id = format!("test_{}", unix_now_ns());
+        self.set_state(StrategyState::HlSubmitting);
+        let signal = StrategySignal::Enter {
+            session_id,
+            leg_hl_side: arb_core::OrderSide::Buy,
+            leg_bn_side: arb_core::OrderSide::Sell,
+            target_qty: size,
+            target_spread_bps: rust_decimal_macros::dec!(50.0),
+            hl_limit_price,
+        };
+        self.handle_signal(signal).await
     }
 
     pub async fn process_quote(&mut self, quote: &L1Quote) -> Result<(), anyhow::Error> {

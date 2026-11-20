@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run => run_engine(config).await?,
         Commands::Check => check_connectivity(config).await?,
         Commands::Reconcile => reconcile_state(config).await?,
+        Commands::TestTrade { size, close } => test_trade(config, size, close).await?,
         Commands::Backtest { quotes_file } => backtest_replay(config, quotes_file).await?,
     }
 
@@ -104,6 +105,116 @@ async fn reconcile_state(config: AppConfig) -> anyhow::Result<()> {
     } else {
         println!("No state snapshot found in {}", config.engine.wal_dir);
     }
+    Ok(())
+}
+
+async fn test_trade(config: AppConfig, size: rust_decimal::Decimal, auto_close: bool) -> anyhow::Result<()> {
+    use arb_core::{clocks::unix_now_ns, L1Quote, VenueId};
+    use rust_decimal_macros::dec;
+
+    println!("==================================================");
+    println!("=== Testing Two-Leg Arbitrage Order Execution ===");
+    println!("==================================================");
+    println!("Configured Mode : {}", if config.engine.dry_run { "DRY-RUN (Simulated Top-of-Book Fills)" } else { "LIVE" });
+    println!("Specified Size  : {}", size);
+    println!("Leg 1 (HL)      : {} (IOC Buy)", config.strategy.symbol_hl);
+    println!("Leg 2 (BN)      : {} (Market Sell Hedge)", config.strategy.symbol_bn);
+    println!("WAL Directory   : {}", config.engine.wal_dir);
+    println!("--------------------------------------------------");
+
+    let wal = WalManager::new(&config.engine.wal_dir)?;
+    let risk_manager = RiskManager::new(config.risk.to_risk_config());
+    let strategy_config = config.strategy.to_strategy_config();
+
+    let dry_executor = Arc::new(DryRunExecutor::new());
+
+    // Provide initial top-of-book quotes
+    let q_hl = L1Quote {
+        venue: VenueId::Hyperliquid,
+        symbol: config.strategy.symbol_hl.clone(),
+        bid_price: dec!(10.00),
+        bid_qty: dec!(1000),
+        ask_price: dec!(10.02),
+        ask_qty: dec!(1000),
+        timestamp_ns: unix_now_ns(),
+        local_recv_ns: unix_now_ns(),
+    };
+    let q_bn = L1Quote {
+        venue: VenueId::BinanceFutures,
+        symbol: config.strategy.symbol_bn.clone(),
+        bid_price: dec!(10.08),
+        bid_qty: dec!(1000),
+        ask_price: dec!(10.10),
+        ask_qty: dec!(1000),
+        timestamp_ns: unix_now_ns(),
+        local_recv_ns: unix_now_ns(),
+    };
+    dry_executor.update_quote(q_hl);
+    dry_executor.update_quote(q_bn);
+
+    let mut engine = ArbitrageEngine::new(
+        strategy_config,
+        risk_manager,
+        wal,
+        dry_executor.clone(),
+    );
+
+    println!("[Step 1] Triggering Leg 1 (HL IOC Buy size={}) & Leg 2 (BN Market Sell Hedge)...", size);
+    let hl_limit_price = dec!(10.05); // allow slippage for IOC matching
+    match engine.trigger_test_order(size, hl_limit_price).await {
+        Ok(_) => {
+            let snap = engine.snapshot();
+            println!("[Step 2] Entry Succeeded!");
+            println!("  * Engine State  : {:?}", engine.state());
+            println!("  * HL Net Pos    : {}", snap.pos_hl.net_qty);
+            println!("  * BN Net Pos    : {}", snap.pos_bn.net_qty);
+            println!("  * Unhedged Delta: {}", (snap.pos_hl.net_qty.abs() - snap.pos_bn.net_qty.abs()).abs());
+        }
+        Err(e) => {
+            println!("[Error] Order execution failed: {}", e);
+            return Err(e);
+        }
+    }
+
+    if auto_close {
+        println!("--------------------------------------------------");
+        println!("[Step 3] Auto-close enabled: Closing both legs...");
+        // Feed quote convergence to trigger exit
+        let q_hl_close = L1Quote {
+            venue: VenueId::Hyperliquid,
+            symbol: config.strategy.symbol_hl.clone(),
+            bid_price: dec!(10.05),
+            bid_qty: dec!(1000),
+            ask_price: dec!(10.06),
+            ask_qty: dec!(1000),
+            timestamp_ns: unix_now_ns(),
+            local_recv_ns: unix_now_ns(),
+        };
+        let q_bn_close = L1Quote {
+            venue: VenueId::BinanceFutures,
+            symbol: config.strategy.symbol_bn.clone(),
+            bid_price: dec!(10.05),
+            bid_qty: dec!(1000),
+            ask_price: dec!(10.06),
+            ask_qty: dec!(1000),
+            timestamp_ns: unix_now_ns(),
+            local_recv_ns: unix_now_ns(),
+        };
+        dry_executor.update_quote(q_hl_close.clone());
+        dry_executor.update_quote(q_bn_close.clone());
+        engine.process_quote(&q_hl_close).await?;
+        engine.process_quote(&q_bn_close).await?;
+
+        let snap = engine.snapshot();
+        println!("  * Final State   : {:?}", engine.state());
+        println!("  * Final HL Pos  : {}", snap.pos_hl.net_qty);
+        println!("  * Final BN Pos  : {}", snap.pos_bn.net_qty);
+        println!("  * Realized PnL  : {} USDT", snap.total_realized_pnl_usdt);
+        println!("  * Total Fees    : {} USDT", snap.total_fees_usdt);
+    }
+
+    println!("==================================================");
+    println!("Test trade completed successfully. WAL records persisted.");
     Ok(())
 }
 
