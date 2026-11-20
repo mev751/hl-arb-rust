@@ -55,6 +55,55 @@ impl<E: ExecutionClient> ArbitrageEngine<E> {
         self.snapshot.state = state;
     }
 
+    pub fn restore_snapshot(&mut self, snapshot: EngineSnapshot) {
+        self.strategy.set_state(snapshot.state);
+        self.snapshot = snapshot;
+    }
+
+    /// Manually flatten and close any open positions across both venues.
+    pub async fn manual_close(&mut self) -> Result<Option<TradeRoundTrip>, anyhow::Error> {
+        let hl_qty = self.snapshot.pos_hl.net_qty;
+        let bn_qty = self.snapshot.pos_bn.net_qty;
+
+        if hl_qty.is_zero() && bn_qty.is_zero() {
+            info!("No open positions to close. Snapshot indicates both sides are zero.");
+            return Ok(None);
+        }
+
+        let qty = hl_qty.abs().max(bn_qty.abs());
+        let leg_hl_side = if hl_qty > Decimal::ZERO {
+            arb_core::OrderSide::Sell
+        } else {
+            arb_core::OrderSide::Buy
+        };
+        let leg_bn_side = if bn_qty > Decimal::ZERO {
+            arb_core::OrderSide::Sell
+        } else {
+            arb_core::OrderSide::Buy
+        };
+
+        info!(
+            hl_qty = %hl_qty,
+            bn_qty = %bn_qty,
+            close_qty = %qty,
+            hl_side = ?leg_hl_side,
+            bn_side = ?leg_bn_side,
+            "Executing manual flatten / close across both venues"
+        );
+
+        let session_id = format!("manual_close_{}", unix_now_ns());
+        let signal = StrategySignal::Exit {
+            session_id,
+            leg_hl_side,
+            leg_bn_side,
+            qty,
+            current_spread_bps: Decimal::ZERO,
+        };
+
+        self.handle_signal(signal).await?;
+        Ok(self.snapshot.completed_trades.last().cloned())
+    }
+
     /// Trigger a test trade for a specified quantity (size) across both legs.
     pub async fn trigger_test_order(
         &mut self,
@@ -315,6 +364,7 @@ impl<E: ExecutionClient> ArbitrageEngine<E> {
                             exit_time_ns: Some(unix_now_ns()),
                         };
 
+                        self.set_state(StrategyState::Idle);
                         {
                             let mut wal = self.wal.lock();
                             wal.log_trade(&trade)?;
@@ -323,8 +373,6 @@ impl<E: ExecutionClient> ArbitrageEngine<E> {
                             self.snapshot.total_fees_usdt += total_fees;
                             wal.save_state(&self.snapshot)?;
                         }
-
-                        self.set_state(StrategyState::Idle);
                     } else {
                         error!("Error closing one or both legs on exit! Check positions.");
                         self.set_state(StrategyState::Unwind);

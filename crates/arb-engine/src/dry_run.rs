@@ -55,17 +55,17 @@ impl ExecutionClient for DryRunExecutor {
                 .ok_or_else(|| ExecutionError::Other(format!("No HL quote available for {}", symbol)))?
         };
 
-        // Check if limit price crosses top-of-book
+        // Check if limit price crosses top-of-book (limit_price <= 0 means aggressive/market fill)
         let fill_price = match side {
             OrderSide::Buy => {
-                if limit_price >= quote.ask_price {
+                if limit_price <= Decimal::ZERO || limit_price >= quote.ask_price {
                     quote.ask_price
                 } else {
                     return Err(ExecutionError::ZeroFill);
                 }
             }
             OrderSide::Sell => {
-                if limit_price <= quote.bid_price {
+                if limit_price <= Decimal::ZERO || limit_price <= quote.bid_price {
                     quote.bid_price
                 } else {
                     return Err(ExecutionError::ZeroFill);

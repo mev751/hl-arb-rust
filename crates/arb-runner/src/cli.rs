@@ -23,6 +23,9 @@ pub enum Commands {
     /// Reconcile open orders and positions against local WAL
     Reconcile,
 
+    /// Manually flatten / close all open positions on both venues immediately
+    Close,
+
     /// Test two-leg order placement with a specified quantity (size) or notional amount (USDT/USD)
     TestTrade {
         /// Order size / token quantity to trade on each side (e.g. --size 2.5)

@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run => run_engine(config).await?,
         Commands::Check => check_connectivity(config).await?,
         Commands::Reconcile => reconcile_state(config).await?,
+        Commands::Close => manual_close(config).await?,
         Commands::TestTrade { size, amount, price, close } => test_trade(config, size, amount, price, close).await?,
         Commands::Backtest { quotes_file } => backtest_replay(config, quotes_file).await?,
     }
@@ -105,6 +106,102 @@ async fn reconcile_state(config: AppConfig) -> anyhow::Result<()> {
     } else {
         println!("No state snapshot found in {}", config.engine.wal_dir);
     }
+    Ok(())
+}
+
+async fn manual_close(config: AppConfig) -> anyhow::Result<()> {
+    use arb_core::{clocks::unix_now_ns, L1Quote, VenueId};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    println!("==================================================");
+    println!("=== Manually Flattening Cross-Venue Positions ===");
+    println!("==================================================");
+    println!("Configured Mode : {}", if config.engine.dry_run { "DRY-RUN (Simulated Fills)" } else { "LIVE" });
+    println!("WAL Directory   : {}", config.engine.wal_dir);
+
+    let wal = WalManager::new(&config.engine.wal_dir)?;
+    let initial_state = wal.load_state()?;
+
+    let (hl_pos, bn_pos) = if let Some(ref snap) = initial_state {
+        (snap.pos_hl.net_qty, snap.pos_bn.net_qty)
+    } else {
+        (Decimal::ZERO, Decimal::ZERO)
+    };
+
+    println!("Current HL Position: {}", hl_pos);
+    println!("Current BN Position: {}", bn_pos);
+
+    if hl_pos.is_zero() && bn_pos.is_zero() {
+        println!("No open positions to close. Both venue positions are zero.");
+        return Ok(());
+    }
+
+    let risk_manager = RiskManager::new(config.risk.to_risk_config());
+    let strategy_config = config.strategy.to_strategy_config();
+    let dry_executor = Arc::new(DryRunExecutor::new());
+
+    // Provide top-of-book quotes for matching
+    let q_hl = L1Quote {
+        venue: VenueId::Hyperliquid,
+        symbol: config.strategy.symbol_hl.clone(),
+        bid_price: dec!(10.04),
+        bid_qty: dec!(1000),
+        ask_price: dec!(10.05),
+        ask_qty: dec!(1000),
+        timestamp_ns: unix_now_ns(),
+        local_recv_ns: unix_now_ns(),
+    };
+    let q_bn = L1Quote {
+        venue: VenueId::BinanceFutures,
+        symbol: config.strategy.symbol_bn.clone(),
+        bid_price: dec!(10.05),
+        bid_qty: dec!(1000),
+        ask_price: dec!(10.06),
+        ask_qty: dec!(1000),
+        timestamp_ns: unix_now_ns(),
+        local_recv_ns: unix_now_ns(),
+    };
+    dry_executor.update_quote(q_hl);
+    dry_executor.update_quote(q_bn);
+
+    let mut engine = ArbitrageEngine::new(
+        strategy_config,
+        risk_manager,
+        wal,
+        dry_executor.clone(),
+    );
+
+    if let Some(state) = initial_state {
+        let mut snap = engine.snapshot().clone();
+        snap.state = state.state;
+        snap.pos_hl = state.pos_hl;
+        snap.pos_bn = state.pos_bn;
+        snap.completed_trades = state.completed_trades;
+        snap.total_realized_pnl_usdt = state.total_realized_pnl_usdt;
+        snap.total_fees_usdt = state.total_fees_usdt;
+        engine.restore_snapshot(snap);
+    }
+
+    println!("--------------------------------------------------");
+    println!("Submitting market close orders on both venues...");
+    match engine.manual_close().await? {
+        Some(trade) => {
+            println!("Manual flatten completed successfully!");
+            println!("  * Final State       : {:?}", engine.state());
+            println!("  * HL Final Position : {}", engine.snapshot().pos_hl.net_qty);
+            println!("  * BN Final Position : {}", engine.snapshot().pos_bn.net_qty);
+            println!("  * Unhedged Delta    : 0.0");
+            println!("  * Trade Net PnL     : {} USDT", trade.net_pnl_usdt);
+            println!("  * Total Fees        : {} USDT", trade.total_fees_usdt);
+            println!("==================================================");
+            println!("WAL state updated and persisted.");
+        }
+        None => {
+            println!("No positions were closed.");
+        }
+    }
+
     Ok(())
 }
 
