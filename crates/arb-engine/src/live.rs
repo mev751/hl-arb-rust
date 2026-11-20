@@ -479,7 +479,7 @@ impl ExecutionClient for LiveExecutor {
                 t: HlOrderTypeWire {
                     limit: HlLimitOrderWire { tif: "Ioc" },
                 },
-                c: Some(client_order_id),
+                c: None,
             }],
             grouping: "na",
         };
