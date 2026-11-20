@@ -694,15 +694,31 @@ impl ExecutionClient for LiveExecutor {
             })
             .unwrap_or(Decimal::ZERO);
 
+        let final_avg_price = if avg_price.is_zero() {
+            let ticker_url = format!("{}/fapi/v1/ticker/bookTicker?symbol={}", self.config.bn_rest_url, clean_symbol);
+            if let Ok(ticker_resp) = self.http.get(&ticker_url).send().await {
+                if let Ok(ticker_json) = ticker_resp.json::<serde_json::Value>().await {
+                    let field = if side == OrderSide::Buy { "askPrice" } else { "bidPrice" };
+                    ticker_json.get(field).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(Decimal::ZERO)
+                } else {
+                    Decimal::ZERO
+                }
+            } else {
+                Decimal::ZERO
+            }
+        } else {
+            avg_price
+        };
+
         let order_id = resp_json.get("orderId").and_then(|o| o.as_i64()).unwrap_or(0);
-        let notional = avg_price * executed_qty;
+        let notional = final_avg_price * executed_qty;
         let fee = notional * Decimal::new(4, 4); // 0.04% (4 bps) taker fee
 
         info!(
             symbol = symbol,
             side = side_str,
             qty = %executed_qty,
-            avg_price = %avg_price,
+            avg_price = %final_avg_price,
             order_id = order_id,
             "Binance LIVE market hedge filled!"
         );
@@ -713,7 +729,7 @@ impl ExecutionClient for LiveExecutor {
             venue: VenueId::BinanceFutures,
             symbol: symbol.to_string(),
             side,
-            price: avg_price,
+            price: final_avg_price,
             qty: executed_qty,
             fee,
             fee_asset: "USDT".to_string(),

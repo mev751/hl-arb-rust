@@ -250,7 +250,7 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                         "Submitting Leg 2: Binance Market Hedge"
                     );
 
-                    let client_order_id = format!("bn_hedge_{}_{}", session_id, unix_now_ns());
+                    let client_order_id = format!("bn_{}", unix_now_ns());
                     let intent = OrderIntent {
                         intent_id: format!("intent_hedge_{}", session_id),
                         client_order_id: client_order_id.clone(),
@@ -311,71 +311,97 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                     session_id,
                     leg_hl_side,
                     leg_bn_side,
-                    qty,
+                    qty: _,
                     current_spread_bps,
                 } => {
+                    let hl_qty_to_close = self.snapshot.pos_hl.net_qty.abs();
+                    let bn_qty_to_close = self.snapshot.pos_bn.net_qty.abs();
+
                     info!(
                         session_id = %session_id,
-                        qty = %qty,
+                        hl_qty = %hl_qty_to_close,
+                        bn_qty = %bn_qty_to_close,
                         spread = %current_spread_bps,
                         "Unwinding cross-venue positions (Exit)"
                     );
 
-                    // Close HL
-                    let hl_cl_id = format!("exit_hl_{}", unix_now_ns());
-                    let hl_fill_res = self
-                        .executor
-                        .submit_hl_ioc(&self.symbol_hl, leg_hl_side, qty, Decimal::ZERO, &hl_cl_id)
-                        .await;
+                    // Close HL if open
+                    let hl_fill_res = if hl_qty_to_close > Decimal::ZERO {
+                        let hl_cl_id = format!("exit_hl_{}", unix_now_ns());
+                        Some(self.executor.submit_hl_ioc(&self.symbol_hl, leg_hl_side, hl_qty_to_close, Decimal::ZERO, &hl_cl_id).await)
+                    } else {
+                        None
+                    };
 
-                    // Close BN
-                    let bn_cl_id = format!("exit_bn_{}", unix_now_ns());
-                    let bn_fill_res = self
-                        .executor
-                        .submit_bn_market(&self.symbol_bn, leg_bn_side, qty, &bn_cl_id)
-                        .await;
+                    // Close BN if open
+                    let bn_fill_res = if bn_qty_to_close > Decimal::ZERO {
+                        let bn_cl_id = format!("exit_bn_{}", unix_now_ns());
+                        Some(self.executor.submit_bn_market(&self.symbol_bn, leg_bn_side, bn_qty_to_close, &bn_cl_id).await)
+                    } else {
+                        None
+                    };
 
-                    if let (Ok(hl_fill), Ok(bn_fill)) = (hl_fill_res, bn_fill_res) {
-                        info!("Both legs successfully closed on exit.");
-                        self.snapshot.pos_hl.apply_fill(&hl_fill);
-                        self.snapshot.pos_bn.apply_fill(&bn_fill);
+                    let mut total_fees = Decimal::ZERO;
+                    let mut hl_price = Decimal::ZERO;
+                    let mut bn_price = Decimal::ZERO;
 
-                        // Compute trade roundtrip record
-                        let total_fees = hl_fill.fee + bn_fill.fee;
-                        let gross_pnl = (bn_fill.price - hl_fill.price) * qty;
-                        let net_pnl = gross_pnl - total_fees;
+                    if let Some(res) = hl_fill_res {
+                        match res {
+                            Ok(fill) => {
+                                info!("HL position closed: qty={} price={}", fill.qty, fill.price);
+                                self.snapshot.pos_hl.apply_fill(&fill);
+                                total_fees += fill.fee;
+                                hl_price = fill.price;
+                            }
+                            Err(e) => error!(error = %e, "Failed to close HL position on exit"),
+                        }
+                    }
 
+                    if let Some(res) = bn_fill_res {
+                        match res {
+                            Ok(fill) => {
+                                info!("BN position closed: qty={} price={}", fill.qty, fill.price);
+                                self.snapshot.pos_bn.apply_fill(&fill);
+                                total_fees += fill.fee;
+                                bn_price = fill.price;
+                            }
+                            Err(e) => error!(error = %e, "Failed to close BN position on exit"),
+                        }
+                    }
+
+                    if self.snapshot.pos_hl.net_qty.is_zero() && self.snapshot.pos_bn.net_qty.is_zero() {
+                        info!("Both legs successfully flattened to zero.");
+                        self.set_state(StrategyState::Idle);
+
+                        let close_qty = hl_qty_to_close.max(bn_qty_to_close);
                         let trade = TradeRoundTrip {
                             trade_id: format!("trade_{}", session_id),
                             symbol_hl: self.symbol_hl.clone(),
                             symbol_bn: self.symbol_bn.clone(),
-                            entry_hl_price: hl_fill.price,
-                            entry_bn_price: bn_fill.price,
-                            entry_qty: qty,
-                            exit_hl_price: Some(hl_fill.price),
-                            exit_bn_price: Some(bn_fill.price),
-                            exit_qty: Some(qty),
+                            entry_hl_price: hl_price,
+                            entry_bn_price: bn_price,
+                            entry_qty: close_qty,
+                            exit_hl_price: Some(hl_price),
+                            exit_bn_price: Some(bn_price),
+                            exit_qty: Some(close_qty),
                             entry_basis_bps: current_spread_bps,
                             exit_basis_bps: Some(current_spread_bps),
-                            gross_pnl_usdt: gross_pnl,
+                            gross_pnl_usdt: Decimal::ZERO,
                             total_fees_usdt: total_fees,
-                            net_pnl_usdt: net_pnl,
+                            net_pnl_usdt: -total_fees,
                             entry_time_ns: unix_now_ns(),
                             exit_time_ns: Some(unix_now_ns()),
                         };
-
-                        self.set_state(StrategyState::Idle);
-                        {
-                            let mut wal = self.wal.lock();
-                            wal.log_trade(&trade)?;
-                            self.snapshot.completed_trades.push(trade);
-                            self.snapshot.total_realized_pnl_usdt += net_pnl;
-                            self.snapshot.total_fees_usdt += total_fees;
-                            wal.save_state(&self.snapshot)?;
-                        }
+                        let mut wal = self.wal.lock();
+                        wal.log_trade(&trade)?;
+                        self.snapshot.completed_trades.push(trade);
+                        self.snapshot.total_fees_usdt += total_fees;
+                        wal.save_state(&self.snapshot)?;
                     } else {
-                        error!("Error closing one or both legs on exit! Check positions.");
+                        error!("Position remaining after exit attempt. pos_hl={} pos_bn={}", self.snapshot.pos_hl.net_qty, self.snapshot.pos_bn.net_qty);
                         self.set_state(StrategyState::Unwind);
+                        let wal = self.wal.lock();
+                        wal.save_state(&self.snapshot)?;
                     }
                     break;
                 }
