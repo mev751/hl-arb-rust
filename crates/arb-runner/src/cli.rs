@@ -24,7 +24,11 @@ pub enum Commands {
     Reconcile,
 
     /// Manually flatten / close all open positions on both venues immediately
-    Close,
+    Close {
+        /// Force LIVE execution mode (sends real orders to exchanges, overrides config.dry_run)
+        #[arg(long, default_value_t = false)]
+        live: bool,
+    },
 
     /// Test two-leg order placement with a specified quantity (size) or notional amount (USDT/USD)
     TestTrade {
@@ -39,6 +43,10 @@ pub enum Commands {
         /// Reference price for converting amount to token quantity (optional, defaults to market quote)
         #[arg(short, long)]
         price: Option<rust_decimal::Decimal>,
+
+        /// Force LIVE execution mode (sends real orders to exchanges, overrides config.dry_run)
+        #[arg(long, default_value_t = false)]
+        live: bool,
 
         /// Automatically unwind (close) both legs after test entry
         #[arg(long, default_value_t = false)]

@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-pub struct ArbitrageEngine<E: ExecutionClient> {
+pub struct ArbitrageEngine<E: ExecutionClient + ?Sized> {
     strategy: CrossVenueArbStrategy,
     risk: RiskManager,
     wal: Mutex<WalManager>,
@@ -19,7 +19,7 @@ pub struct ArbitrageEngine<E: ExecutionClient> {
     symbol_bn: String,
 }
 
-impl<E: ExecutionClient> ArbitrageEngine<E> {
+impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
     pub fn new(
         config: StrategyConfig,
         risk: RiskManager,

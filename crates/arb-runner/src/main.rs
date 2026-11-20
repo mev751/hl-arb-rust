@@ -9,7 +9,10 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use arb_core::{L1Quote, RiskManager, WalManager};
-use arb_engine::{ArbitrageEngine, DryRunExecutor, StartupReconciler};
+use arb_engine::{
+    ArbitrageEngine, DryRunExecutor, ExecutionClient, LiveExecutor, LiveExecutorConfig,
+    StartupReconciler,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run => run_engine(config).await?,
         Commands::Check => check_connectivity(config).await?,
         Commands::Reconcile => reconcile_state(config).await?,
-        Commands::Close => manual_close(config).await?,
-        Commands::TestTrade { size, amount, price, close } => test_trade(config, size, amount, price, close).await?,
+        Commands::Close { live } => manual_close(config, live).await?,
+        Commands::TestTrade { size, amount, price, live, close } => test_trade(config, size, amount, price, live, close).await?,
         Commands::Backtest { quotes_file } => backtest_replay(config, quotes_file).await?,
     }
 
@@ -60,11 +63,30 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
     let strategy_config = config.strategy.to_strategy_config();
 
     // Use DryRunExecutor or LiveExecutor based on config
-    let dry_executor = Arc::new(DryRunExecutor::new());
+    let executor: Arc<dyn ExecutionClient> = if config.engine.dry_run {
+        Arc::new(DryRunExecutor::new())
+    } else {
+        let hl_dex = if let Some((prefix, _)) = config.strategy.symbol_hl.split_once(':') {
+            prefix.to_string()
+        } else {
+            String::new()
+        };
+        let live_config = LiveExecutorConfig {
+            bn_api_key: config.venues.binance.api_key.clone(),
+            bn_api_secret: config.venues.binance.api_secret.clone(),
+            bn_rest_url: config.venues.binance.rest_url.clone(),
+            hl_wallet: config.venues.hyperliquid.wallet_address.clone(),
+            hl_private_key: config.venues.hyperliquid.private_key.clone(),
+            hl_rest_url: config.venues.hyperliquid.rest_url.clone(),
+            hl_is_mainnet: config.venues.hyperliquid.is_mainnet,
+            hl_dex,
+        };
+        Arc::new(LiveExecutor::new(live_config)?)
+    };
 
     // Reconcile on startup
     let initial_state = StartupReconciler::reconcile_on_startup(
-        dry_executor.as_ref(),
+        executor.as_ref(),
         existing_snapshot.as_ref(),
         &config.strategy.symbol_hl,
         &config.strategy.symbol_bn,
@@ -77,7 +99,7 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
         strategy_config,
         risk_manager,
         wal,
-        dry_executor.clone(),
+        executor.clone(),
     );
     engine.set_state(initial_state);
 
@@ -149,15 +171,17 @@ async fn reconcile_state(config: AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn manual_close(config: AppConfig) -> anyhow::Result<()> {
+async fn manual_close(config: AppConfig, force_live: bool) -> anyhow::Result<()> {
     use arb_core::{clocks::unix_now_ns, L1Quote, VenueId};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
+    let is_live = force_live || !config.engine.dry_run;
+
     println!("==================================================");
     println!("=== Manually Flattening Cross-Venue Positions ===");
     println!("==================================================");
-    println!("Configured Mode : {}", if config.engine.dry_run { "DRY-RUN (Simulated Fills)" } else { "LIVE" });
+    println!("Execution Mode  : {}", if is_live { "LIVE (Real Exchange Orders)" } else { "DRY-RUN (Simulated Fills)" });
     println!("WAL Directory   : {}", config.engine.wal_dir);
 
     let wal = WalManager::new(&config.engine.wal_dir)?;
@@ -179,37 +203,56 @@ async fn manual_close(config: AppConfig) -> anyhow::Result<()> {
 
     let risk_manager = RiskManager::new(config.risk.to_risk_config());
     let strategy_config = config.strategy.to_strategy_config();
-    let dry_executor = Arc::new(DryRunExecutor::new());
 
-    // Provide top-of-book quotes for matching
-    let q_hl = L1Quote {
-        venue: VenueId::Hyperliquid,
-        symbol: config.strategy.symbol_hl.clone(),
-        bid_price: dec!(10.04),
-        bid_qty: dec!(1000),
-        ask_price: dec!(10.05),
-        ask_qty: dec!(1000),
-        timestamp_ns: unix_now_ns(),
-        local_recv_ns: unix_now_ns(),
+    let executor: Arc<dyn ExecutionClient> = if is_live {
+        let hl_dex = if let Some((prefix, _)) = config.strategy.symbol_hl.split_once(':') {
+            prefix.to_string()
+        } else {
+            String::new()
+        };
+        let live_config = LiveExecutorConfig {
+            bn_api_key: config.venues.binance.api_key.clone(),
+            bn_api_secret: config.venues.binance.api_secret.clone(),
+            bn_rest_url: config.venues.binance.rest_url.clone(),
+            hl_wallet: config.venues.hyperliquid.wallet_address.clone(),
+            hl_private_key: config.venues.hyperliquid.private_key.clone(),
+            hl_rest_url: config.venues.hyperliquid.rest_url.clone(),
+            hl_is_mainnet: config.venues.hyperliquid.is_mainnet,
+            hl_dex,
+        };
+        Arc::new(LiveExecutor::new(live_config)?)
+    } else {
+        let dry_executor = Arc::new(DryRunExecutor::new());
+        let q_hl = L1Quote {
+            venue: VenueId::Hyperliquid,
+            symbol: config.strategy.symbol_hl.clone(),
+            bid_price: dec!(10.04),
+            bid_qty: dec!(1000),
+            ask_price: dec!(10.05),
+            ask_qty: dec!(1000),
+            timestamp_ns: unix_now_ns(),
+            local_recv_ns: unix_now_ns(),
+        };
+        let q_bn = L1Quote {
+            venue: VenueId::BinanceFutures,
+            symbol: config.strategy.symbol_bn.clone(),
+            bid_price: dec!(10.05),
+            bid_qty: dec!(1000),
+            ask_price: dec!(10.06),
+            ask_qty: dec!(1000),
+            timestamp_ns: unix_now_ns(),
+            local_recv_ns: unix_now_ns(),
+        };
+        dry_executor.update_quote(q_hl);
+        dry_executor.update_quote(q_bn);
+        dry_executor
     };
-    let q_bn = L1Quote {
-        venue: VenueId::BinanceFutures,
-        symbol: config.strategy.symbol_bn.clone(),
-        bid_price: dec!(10.05),
-        bid_qty: dec!(1000),
-        ask_price: dec!(10.06),
-        ask_qty: dec!(1000),
-        timestamp_ns: unix_now_ns(),
-        local_recv_ns: unix_now_ns(),
-    };
-    dry_executor.update_quote(q_hl);
-    dry_executor.update_quote(q_bn);
 
     let mut engine = ArbitrageEngine::new(
         strategy_config,
         risk_manager,
         wal,
-        dry_executor.clone(),
+        executor,
     );
 
     if let Some(state) = initial_state {
@@ -250,16 +293,19 @@ async fn test_trade(
     size_opt: Option<rust_decimal::Decimal>,
     amount_opt: Option<rust_decimal::Decimal>,
     ref_price_opt: Option<rust_decimal::Decimal>,
+    force_live: bool,
     auto_close: bool,
 ) -> anyhow::Result<()> {
     use arb_core::{clocks::unix_now_ns, math::quantize_qty, L1Quote, VenueId};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
+    let is_live = force_live || !config.engine.dry_run;
+
     println!("==================================================");
     println!("=== Testing Two-Leg Arbitrage Order Execution ===");
     println!("==================================================");
-    println!("Configured Mode : {}", if config.engine.dry_run { "DRY-RUN (Simulated Top-of-Book Fills)" } else { "LIVE" });
+    println!("Execution Mode  : {}", if is_live { "LIVE (Real Exchange Orders)" } else { "DRY-RUN (Simulated Top-of-Book Fills)" });
     println!("Leg 1 (HL)      : {} (IOC Buy)", config.strategy.symbol_hl);
     println!("Leg 2 (BN)      : {} (Market Sell Hedge)", config.strategy.symbol_bn);
     println!("WAL Directory   : {}", config.engine.wal_dir);
@@ -268,31 +314,55 @@ async fn test_trade(
     let risk_manager = RiskManager::new(config.risk.to_risk_config());
     let strategy_config = config.strategy.to_strategy_config();
 
-    let dry_executor = Arc::new(DryRunExecutor::new());
-
-    // Provide initial top-of-book quotes
-    let q_hl = L1Quote {
-        venue: VenueId::Hyperliquid,
-        symbol: config.strategy.symbol_hl.clone(),
-        bid_price: dec!(10.00),
-        bid_qty: dec!(1000),
-        ask_price: dec!(10.02),
-        ask_qty: dec!(1000),
-        timestamp_ns: unix_now_ns(),
-        local_recv_ns: unix_now_ns(),
+    let (executor, q_hl, _q_bn): (Arc<dyn ExecutionClient>, L1Quote, L1Quote) = if is_live {
+        let hl_dex = if let Some((prefix, _)) = config.strategy.symbol_hl.split_once(':') {
+            prefix.to_string()
+        } else {
+            String::new()
+        };
+        let live_config = LiveExecutorConfig {
+            bn_api_key: config.venues.binance.api_key.clone(),
+            bn_api_secret: config.venues.binance.api_secret.clone(),
+            bn_rest_url: config.venues.binance.rest_url.clone(),
+            hl_wallet: config.venues.hyperliquid.wallet_address.clone(),
+            hl_private_key: config.venues.hyperliquid.private_key.clone(),
+            hl_rest_url: config.venues.hyperliquid.rest_url.clone(),
+            hl_is_mainnet: config.venues.hyperliquid.is_mainnet,
+            hl_dex,
+        };
+        let live_exec = Arc::new(LiveExecutor::new(live_config)?);
+        println!("Fetching live L1 quotes from Hyperliquid & Binance...");
+        let (quotes_hl, quotes_bn) = live_exec.fetch_live_quotes(&config.strategy.symbol_hl, &config.strategy.symbol_bn).await?;
+        println!("Live Top-of-Book Quotes:");
+        println!("  * Hyperliquid ({}) : Bid {} | Ask {}", config.strategy.symbol_hl, quotes_hl.bid_price, quotes_hl.ask_price);
+        println!("  * Binance     ({}) : Bid {} | Ask {}", config.strategy.symbol_bn, quotes_bn.bid_price, quotes_bn.ask_price);
+        (live_exec, quotes_hl, quotes_bn)
+    } else {
+        let dry_executor = Arc::new(DryRunExecutor::new());
+        let dry_hl = L1Quote {
+            venue: VenueId::Hyperliquid,
+            symbol: config.strategy.symbol_hl.clone(),
+            bid_price: dec!(10.00),
+            bid_qty: dec!(1000),
+            ask_price: dec!(10.02),
+            ask_qty: dec!(1000),
+            timestamp_ns: unix_now_ns(),
+            local_recv_ns: unix_now_ns(),
+        };
+        let dry_bn = L1Quote {
+            venue: VenueId::BinanceFutures,
+            symbol: config.strategy.symbol_bn.clone(),
+            bid_price: dec!(10.08),
+            bid_qty: dec!(1000),
+            ask_price: dec!(10.10),
+            ask_qty: dec!(1000),
+            timestamp_ns: unix_now_ns(),
+            local_recv_ns: unix_now_ns(),
+        };
+        dry_executor.update_quote(dry_hl.clone());
+        dry_executor.update_quote(dry_bn.clone());
+        (dry_executor, dry_hl, dry_bn)
     };
-    let q_bn = L1Quote {
-        venue: VenueId::BinanceFutures,
-        symbol: config.strategy.symbol_bn.clone(),
-        bid_price: dec!(10.08),
-        bid_qty: dec!(1000),
-        ask_price: dec!(10.10),
-        ask_qty: dec!(1000),
-        timestamp_ns: unix_now_ns(),
-        local_recv_ns: unix_now_ns(),
-    };
-    dry_executor.update_quote(q_hl.clone());
-    dry_executor.update_quote(q_bn.clone());
 
     let step_size = config.strategy.hl_step_size;
     let base_price = ref_price_opt.unwrap_or(q_hl.ask_price);
@@ -301,26 +371,26 @@ async fn test_trade(
         let raw_qty = amount / base_price;
         let quantized = quantize_qty(raw_qty, step_size);
         let actual_notional = quantized * base_price;
-        let info = format!("Specified Notional: {} USDT | Ref Price: {} USDT -> Quantized Qty: {} (Actual Notional: {} USDT)",
+        let info = format!("Specified Notional: {} USDT | Ref Price: {} USDT -> Quantized Qty: {} (Actual Notional: {:.2} USDT)",
             amount, base_price, quantized, actual_notional);
         (quantized, info)
     } else if let Some(size) = size_opt {
         let quantized = quantize_qty(size, step_size);
         let actual_notional = quantized * base_price;
-        let info = format!("Specified Size: {} | Ref Price: {} USDT -> Estimated Notional: {} USDT",
+        let info = format!("Specified Size: {} | Ref Price: {} USDT -> Estimated Notional: {:.2} USDT",
             quantized, base_price, actual_notional);
         (quantized, info)
     } else if let Some(cfg_notional) = config.strategy.order_chunk_notional_usd {
         let raw_qty = cfg_notional / base_price;
         let quantized = quantize_qty(raw_qty, step_size);
         let actual_notional = quantized * base_price;
-        let info = format!("Config Notional: {} USDT | Ref Price: {} USDT -> Quantized Qty: {} (Actual Notional: {} USDT)",
+        let info = format!("Config Notional: {} USDT | Ref Price: {} USDT -> Quantized Qty: {} (Actual Notional: {:.2} USDT)",
             cfg_notional, base_price, quantized, actual_notional);
         (quantized, info)
     } else {
         let size = quantize_qty(config.strategy.order_chunk_qty, step_size);
         let actual_notional = size * base_price;
-        let info = format!("Default Config Size: {} | Ref Price: {} USDT -> Estimated Notional: {} USDT",
+        let info = format!("Default Config Size: {} | Ref Price: {} USDT -> Estimated Notional: {:.2} USDT",
             size, base_price, actual_notional);
         (size, info)
     };
@@ -337,11 +407,14 @@ async fn test_trade(
         strategy_config,
         risk_manager,
         wal,
-        dry_executor.clone(),
+        executor.clone(),
     );
 
-    println!("[Step 1] Triggering Leg 1 (HL IOC Buy qty={}) & Leg 2 (BN Market Sell Hedge)...", trade_qty);
-    let hl_limit_price = dec!(10.05); // allow slippage for IOC matching
+    // Allow slippage buffer above ask for guaranteed IOC execution
+    let slippage_mult = Decimal::ONE + (config.strategy.hl_slippage_bps / dec!(10000.0)).max(dec!(0.005));
+    let hl_limit_price = (base_price * slippage_mult).round_dp(2);
+
+    println!("[Step 1] Triggering Leg 1 (HL IOC Buy qty={}, limit_price={}) & Leg 2 (BN Market Sell Hedge)...", trade_qty, hl_limit_price);
     match engine.trigger_test_order(trade_qty, hl_limit_price).await {
         Ok(_) => {
             let snap = engine.snapshot();
@@ -360,38 +433,21 @@ async fn test_trade(
     if auto_close {
         println!("--------------------------------------------------");
         println!("[Step 3] Auto-close enabled: Closing both legs...");
-        // Feed quote convergence to trigger exit
-        let q_hl_close = L1Quote {
-            venue: VenueId::Hyperliquid,
-            symbol: config.strategy.symbol_hl.clone(),
-            bid_price: dec!(10.05),
-            bid_qty: dec!(1000),
-            ask_price: dec!(10.06),
-            ask_qty: dec!(1000),
-            timestamp_ns: unix_now_ns(),
-            local_recv_ns: unix_now_ns(),
-        };
-        let q_bn_close = L1Quote {
-            venue: VenueId::BinanceFutures,
-            symbol: config.strategy.symbol_bn.clone(),
-            bid_price: dec!(10.05),
-            bid_qty: dec!(1000),
-            ask_price: dec!(10.06),
-            ask_qty: dec!(1000),
-            timestamp_ns: unix_now_ns(),
-            local_recv_ns: unix_now_ns(),
-        };
-        dry_executor.update_quote(q_hl_close.clone());
-        dry_executor.update_quote(q_bn_close.clone());
-        engine.process_quote(&q_hl_close).await?;
-        engine.process_quote(&q_bn_close).await?;
-
-        let snap = engine.snapshot();
-        println!("  * Final State   : {:?}", engine.state());
-        println!("  * Final HL Pos  : {}", snap.pos_hl.net_qty);
-        println!("  * Final BN Pos  : {}", snap.pos_bn.net_qty);
-        println!("  * Realized PnL  : {} USDT", snap.total_realized_pnl_usdt);
-        println!("  * Total Fees    : {} USDT", snap.total_fees_usdt);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match engine.manual_close().await? {
+            Some(trade) => {
+                let snap = engine.snapshot();
+                println!("  * Close Succeeded!");
+                println!("  * Final State   : {:?}", engine.state());
+                println!("  * Final HL Pos  : {}", snap.pos_hl.net_qty);
+                println!("  * Final BN Pos  : {}", snap.pos_bn.net_qty);
+                println!("  * Trade Net PnL : {} USDT", trade.net_pnl_usdt);
+                println!("  * Total Fees    : {} USDT", trade.total_fees_usdt);
+            }
+            None => {
+                println!("  * Warning: No open positions were found to close.");
+            }
+        }
     }
 
     println!("==================================================");

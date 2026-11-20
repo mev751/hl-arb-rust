@@ -19,6 +19,13 @@ thiserror.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 parking_lot.workspace = true
+reqwest.workspace = true
+sha3.workspace = true
+k256.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rmp-serde.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

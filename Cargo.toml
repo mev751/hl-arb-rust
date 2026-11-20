@@ -45,3 +45,12 @@ anyhow = "1.0"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 parking_lot = "0.12"
 clap = { version = "4.5", features = ["derive", "env"] }
+
+# Networking & Cryptography
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+sha3 = "0.10"
+k256 = { version = "0.13", features = ["ecdsa"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rmp-serde = "1.3"

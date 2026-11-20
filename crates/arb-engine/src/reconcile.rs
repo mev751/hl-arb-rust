@@ -7,7 +7,7 @@ pub struct StartupReconciler;
 
 impl StartupReconciler {
     /// Reconcile state from disk against live exchange positions.
-    pub async fn reconcile_on_startup<E: ExecutionClient>(
+    pub async fn reconcile_on_startup<E: ExecutionClient + ?Sized>(
         executor: &E,
         snapshot: Option<&EngineSnapshot>,
         symbol_hl: &str,
