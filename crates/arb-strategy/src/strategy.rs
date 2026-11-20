@@ -16,6 +16,7 @@ pub struct StrategyConfig {
     pub entry_spread_bps: Decimal,
     pub exit_spread_bps: Decimal,
     pub order_chunk_qty: Decimal,
+    pub order_chunk_notional_usd: Option<Decimal>,
     pub max_position_qty: Decimal,
     pub hl_slippage_bps: Decimal,
     pub hl_tick_size: Decimal,
@@ -114,7 +115,13 @@ impl ArbitrageStrategy for CrossVenueArbStrategy {
                 );
 
                 if exec_spread_bps >= self.config.entry_spread_bps && net_edge_bps > Decimal::ZERO {
-                    let target_qty = quantize_qty(self.config.order_chunk_qty, self.config.hl_step_size);
+                    let raw_qty = match self.config.order_chunk_notional_usd {
+                        Some(notional) if notional > Decimal::ZERO => {
+                            notional / hl_quote.ask_price
+                        }
+                        _ => self.config.order_chunk_qty,
+                    };
+                    let target_qty = quantize_qty(raw_qty, self.config.hl_step_size);
                     if target_qty <= Decimal::ZERO {
                         return None;
                     }
@@ -267,6 +274,7 @@ mod tests {
             entry_spread_bps: dec!(40.0),
             exit_spread_bps: dec!(10.0),
             order_chunk_qty: dec!(10.0),
+            order_chunk_notional_usd: None,
             max_position_qty: dec!(50.0),
             hl_slippage_bps: dec!(10.0),
             hl_tick_size: dec!(0.01),

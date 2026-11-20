@@ -26,6 +26,8 @@ pub struct StrategySettings {
     pub entry_spread_bps: Decimal,
     pub exit_spread_bps: Decimal,
     pub order_chunk_qty: Decimal,
+    #[serde(default)]
+    pub order_chunk_notional_usd: Option<Decimal>,
     pub max_position_qty: Decimal,
     pub hl_slippage_bps: Decimal,
     pub hl_tick_size: Decimal,
@@ -42,6 +44,7 @@ impl StrategySettings {
             entry_spread_bps: self.entry_spread_bps,
             exit_spread_bps: self.exit_spread_bps,
             order_chunk_qty: self.order_chunk_qty,
+            order_chunk_notional_usd: self.order_chunk_notional_usd,
             max_position_qty: self.max_position_qty,
             hl_slippage_bps: self.hl_slippage_bps,
             hl_tick_size: self.hl_tick_size,

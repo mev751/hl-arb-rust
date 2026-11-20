@@ -27,6 +27,7 @@ async fn test_full_arbitrage_lifecycle() -> anyhow::Result<()> {
         entry_spread_bps: dec!(40.0),
         exit_spread_bps: dec!(10.0),
         order_chunk_qty: dec!(10.0),
+        order_chunk_notional_usd: None,
         max_position_qty: dec!(100.0),
         hl_slippage_bps: dec!(10.0),
         hl_tick_size: dec!(0.01),

@@ -23,11 +23,19 @@ pub enum Commands {
     /// Reconcile open orders and positions against local WAL
     Reconcile,
 
-    /// Test two-leg order placement with a specified quantity (size)
+    /// Test two-leg order placement with a specified quantity (size) or notional amount (USDT/USD)
     TestTrade {
-        /// Order size / quantity to trade on both sides
-        #[arg(short, long, default_value = "1.0")]
-        size: rust_decimal::Decimal,
+        /// Order size / token quantity to trade on each side (e.g. --size 2.5)
+        #[arg(short, long)]
+        size: Option<rust_decimal::Decimal>,
+
+        /// Target notional amount (每边下单金额 in USDT/USD, e.g. --amount 100 or --notional 100)
+        #[arg(short, long, alias = "notional")]
+        amount: Option<rust_decimal::Decimal>,
+
+        /// Reference price for converting amount to token quantity (optional, defaults to market quote)
+        #[arg(short, long)]
+        price: Option<rust_decimal::Decimal>,
 
         /// Automatically unwind (close) both legs after test entry
         #[arg(long, default_value_t = false)]

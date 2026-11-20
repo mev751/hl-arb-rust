@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run => run_engine(config).await?,
         Commands::Check => check_connectivity(config).await?,
         Commands::Reconcile => reconcile_state(config).await?,
-        Commands::TestTrade { size, close } => test_trade(config, size, close).await?,
+        Commands::TestTrade { size, amount, price, close } => test_trade(config, size, amount, price, close).await?,
         Commands::Backtest { quotes_file } => backtest_replay(config, quotes_file).await?,
     }
 
@@ -108,19 +108,24 @@ async fn reconcile_state(config: AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn test_trade(config: AppConfig, size: rust_decimal::Decimal, auto_close: bool) -> anyhow::Result<()> {
-    use arb_core::{clocks::unix_now_ns, L1Quote, VenueId};
+async fn test_trade(
+    config: AppConfig,
+    size_opt: Option<rust_decimal::Decimal>,
+    amount_opt: Option<rust_decimal::Decimal>,
+    ref_price_opt: Option<rust_decimal::Decimal>,
+    auto_close: bool,
+) -> anyhow::Result<()> {
+    use arb_core::{clocks::unix_now_ns, math::quantize_qty, L1Quote, VenueId};
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     println!("==================================================");
     println!("=== Testing Two-Leg Arbitrage Order Execution ===");
     println!("==================================================");
     println!("Configured Mode : {}", if config.engine.dry_run { "DRY-RUN (Simulated Top-of-Book Fills)" } else { "LIVE" });
-    println!("Specified Size  : {}", size);
     println!("Leg 1 (HL)      : {} (IOC Buy)", config.strategy.symbol_hl);
     println!("Leg 2 (BN)      : {} (Market Sell Hedge)", config.strategy.symbol_bn);
     println!("WAL Directory   : {}", config.engine.wal_dir);
-    println!("--------------------------------------------------");
 
     let wal = WalManager::new(&config.engine.wal_dir)?;
     let risk_manager = RiskManager::new(config.risk.to_risk_config());
@@ -149,8 +154,47 @@ async fn test_trade(config: AppConfig, size: rust_decimal::Decimal, auto_close: 
         timestamp_ns: unix_now_ns(),
         local_recv_ns: unix_now_ns(),
     };
-    dry_executor.update_quote(q_hl);
-    dry_executor.update_quote(q_bn);
+    dry_executor.update_quote(q_hl.clone());
+    dry_executor.update_quote(q_bn.clone());
+
+    let step_size = config.strategy.hl_step_size;
+    let base_price = ref_price_opt.unwrap_or(q_hl.ask_price);
+
+    let (trade_qty, notional_info) = if let Some(amount) = amount_opt {
+        let raw_qty = amount / base_price;
+        let quantized = quantize_qty(raw_qty, step_size);
+        let actual_notional = quantized * base_price;
+        let info = format!("Specified Notional: {} USDT | Ref Price: {} USDT -> Quantized Qty: {} (Actual Notional: {} USDT)",
+            amount, base_price, quantized, actual_notional);
+        (quantized, info)
+    } else if let Some(size) = size_opt {
+        let quantized = quantize_qty(size, step_size);
+        let actual_notional = quantized * base_price;
+        let info = format!("Specified Size: {} | Ref Price: {} USDT -> Estimated Notional: {} USDT",
+            quantized, base_price, actual_notional);
+        (quantized, info)
+    } else if let Some(cfg_notional) = config.strategy.order_chunk_notional_usd {
+        let raw_qty = cfg_notional / base_price;
+        let quantized = quantize_qty(raw_qty, step_size);
+        let actual_notional = quantized * base_price;
+        let info = format!("Config Notional: {} USDT | Ref Price: {} USDT -> Quantized Qty: {} (Actual Notional: {} USDT)",
+            cfg_notional, base_price, quantized, actual_notional);
+        (quantized, info)
+    } else {
+        let size = quantize_qty(config.strategy.order_chunk_qty, step_size);
+        let actual_notional = size * base_price;
+        let info = format!("Default Config Size: {} | Ref Price: {} USDT -> Estimated Notional: {} USDT",
+            size, base_price, actual_notional);
+        (size, info)
+    };
+
+    if trade_qty <= Decimal::ZERO {
+        anyhow::bail!("Calculated trade quantity is zero. Please increase order amount/size or check step_size (current: {}).", step_size);
+    }
+
+    println!("Execution Param : {}", notional_info);
+    println!("Target Trade Qty: {} per leg", trade_qty);
+    println!("--------------------------------------------------");
 
     let mut engine = ArbitrageEngine::new(
         strategy_config,
@@ -159,9 +203,9 @@ async fn test_trade(config: AppConfig, size: rust_decimal::Decimal, auto_close: 
         dry_executor.clone(),
     );
 
-    println!("[Step 1] Triggering Leg 1 (HL IOC Buy size={}) & Leg 2 (BN Market Sell Hedge)...", size);
+    println!("[Step 1] Triggering Leg 1 (HL IOC Buy qty={}) & Leg 2 (BN Market Sell Hedge)...", trade_qty);
     let hl_limit_price = dec!(10.05); // allow slippage for IOC matching
-    match engine.trigger_test_order(size, hl_limit_price).await {
+    match engine.trigger_test_order(trade_qty, hl_limit_price).await {
         Ok(_) => {
             let snap = engine.snapshot();
             println!("[Step 2] Entry Succeeded!");
