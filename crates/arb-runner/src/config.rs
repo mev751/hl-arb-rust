@@ -103,8 +103,77 @@ pub struct HyperliquidVenueConfig {
 
 impl AppConfig {
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        load_dotenv();
         let content = std::fs::read_to_string(path)?;
-        let config: AppConfig = toml::from_str(&content)?;
+        let mut config: AppConfig = toml::from_str(&content)?;
+        config.resolve_env_overrides();
         Ok(config)
+    }
+
+    pub fn resolve_env_overrides(&mut self) {
+        resolve_field(&mut self.venues.hyperliquid.private_key, &["HL_PRIVATE_KEY", "ENV_HL_PRIVATE_KEY", "HYPERLIQUID_PRIVATE_KEY"]);
+        resolve_field(&mut self.venues.hyperliquid.wallet_address, &["HL_WALLET_ADDRESS", "ENV_HL_WALLET_ADDRESS", "HYPERLIQUID_WALLET_ADDRESS"]);
+        resolve_field(&mut self.venues.binance.api_key, &["BINANCE_API_KEY", "ENV_BINANCE_API_KEY"]);
+        resolve_field(&mut self.venues.binance.api_secret, &["BINANCE_API_SECRET", "ENV_BINANCE_API_SECRET"]);
+    }
+}
+
+fn resolve_field(field: &mut String, fallback_env_names: &[&str]) {
+    let trimmed = field.trim();
+    // 1. Check if format is ${VAR} or $VAR
+    if let Some(var_name) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        if let Ok(val) = std::env::var(var_name) {
+            *field = val;
+            return;
+        }
+    } else if let Some(var_name) = trimmed.strip_prefix('$') {
+        if let Ok(val) = std::env::var(var_name) {
+            *field = val;
+            return;
+        }
+    } else if trimmed.starts_with("ENV_") {
+        if let Ok(val) = std::env::var(trimmed) {
+            *field = val;
+            return;
+        }
+        if let Some(stripped) = trimmed.strip_prefix("ENV_") {
+            if let Ok(val) = std::env::var(stripped) {
+                *field = val;
+                return;
+            }
+        }
+    }
+
+    // 2. Check fallback standard env names
+    for &name in fallback_env_names {
+        if let Ok(val) = std::env::var(name) {
+            if !val.trim().is_empty() {
+                *field = val;
+                return;
+            }
+        }
+    }
+}
+
+/// Automatically loads KEY=VALUE pairs from a local .env file if present
+pub fn load_dotenv() {
+    let dotenv_paths = [".env", "config/.env", "../.env"];
+    for p in &dotenv_paths {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches('"').trim_matches('\'');
+                    if !key.is_empty() && std::env::var(key).is_err() {
+                        std::env::set_var(key, val);
+                    }
+                }
+            }
+            break;
+        }
     }
 }

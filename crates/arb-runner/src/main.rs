@@ -86,12 +86,52 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
 }
 
 async fn check_connectivity(config: AppConfig) -> anyhow::Result<()> {
-    info!(
-        bn_rest = %config.venues.binance.rest_url,
-        hl_rest = %config.venues.hyperliquid.rest_url,
-        "Checking venue connectivity and accounts"
-    );
-    println!("Connectivity check: OK");
+    println!("==================================================");
+    println!("=== Checking Venue Configuration & Credentials ===");
+    println!("==================================================");
+
+    fn mask_secret(s: &str) -> String {
+        if s.len() <= 8 {
+            "***".to_string()
+        } else {
+            format!("{}...{}", &s[..4], &s[s.len() - 4..])
+        }
+    }
+
+    let hl_pk = &config.venues.hyperliquid.private_key;
+    let hl_wallet = &config.venues.hyperliquid.wallet_address;
+    let is_hl_pk_set = !hl_pk.is_empty() && !hl_pk.starts_with("ENV_");
+    let is_hl_wallet_set = !hl_wallet.is_empty() && !hl_wallet.starts_with("ENV_");
+
+    println!("Hyperliquid:");
+    println!("  * REST URL   : {}", config.venues.hyperliquid.rest_url);
+    println!("  * WS URL     : {}", config.venues.hyperliquid.ws_url);
+    println!("  * Wallet     : {}", if is_hl_wallet_set { hl_wallet.clone() } else { format!("[UNSET: {}]", hl_wallet) });
+    println!("  * Private Key: {}", if is_hl_pk_set { mask_secret(hl_pk) } else { format!("[UNSET: {}]", hl_pk) });
+
+    let bn_key = &config.venues.binance.api_key;
+    let bn_secret = &config.venues.binance.api_secret;
+    let is_bn_key_set = !bn_key.is_empty() && !bn_key.starts_with("ENV_");
+    let is_bn_secret_set = !bn_secret.is_empty() && !bn_secret.starts_with("ENV_");
+
+    println!("Binance Futures:");
+    println!("  * REST URL   : {}", config.venues.binance.rest_url);
+    println!("  * WS URL     : {}", config.venues.binance.ws_url);
+    println!("  * API Key    : {}", if is_bn_key_set { mask_secret(bn_key) } else { format!("[UNSET: {}]", bn_key) });
+    println!("  * API Secret : {}", if is_bn_secret_set { mask_secret(bn_secret) } else { format!("[UNSET: {}]", bn_secret) });
+    println!("--------------------------------------------------");
+
+    if is_hl_pk_set && is_hl_wallet_set && is_bn_key_set && is_bn_secret_set {
+        println!("All credentials loaded successfully!");
+    } else {
+        println!("Notice: Some credentials are still placeholders.");
+        println!("You can set them via a .env file or environment variables:");
+        println!("  export HL_PRIVATE_KEY=\"0x...\"");
+        println!("  export HL_WALLET_ADDRESS=\"0x...\"");
+        println!("  export BINANCE_API_KEY=\"...\"");
+        println!("  export BINANCE_API_SECRET=\"...\"");
+    }
+
     Ok(())
 }
 
