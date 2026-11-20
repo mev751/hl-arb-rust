@@ -5,7 +5,7 @@ use clap::Parser;
 use cli::{Cli, Commands};
 use config::AppConfig;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use arb_core::{L1Quote, RiskManager, WalManager};
@@ -18,21 +18,22 @@ use arb_engine::{
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info,arb=debug"))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    info!("Starting Nautilus Arbitrage Engine...");
-
     let config = match AppConfig::from_file(&cli.config) {
         Ok(c) => c,
         Err(e) => {
-            error!(error = %e, path = ?cli.config, "Failed to load config file");
+            eprintln!("Failed to load config file {:?}: {}", cli.config, e);
             return Err(e);
         }
     };
+
+    // Initialize tracing using RUST_LOG or config.engine.log_level (defaults to info)
+    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| config.engine.log_level.clone());
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(&log_level))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    info!(log_level = %log_level, "Starting Nautilus Arbitrage Engine...");
 
     let command = cli.command.unwrap_or(Commands::Run);
 
