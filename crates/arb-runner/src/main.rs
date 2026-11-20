@@ -101,9 +101,73 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
         wal,
         executor.clone(),
     );
-    engine.set_state(initial_state);
 
-    info!("Engine loop running. Waiting for market data streams...");
+    if let Some(state) = existing_snapshot {
+        let mut snap = engine.snapshot().clone();
+        snap.state = initial_state;
+        snap.pos_hl = state.pos_hl;
+        snap.pos_bn = state.pos_bn;
+        snap.completed_trades = state.completed_trades;
+        snap.total_realized_pnl_usdt = state.total_realized_pnl_usdt;
+        snap.total_fees_usdt = state.total_fees_usdt;
+        engine.restore_snapshot(snap);
+    } else {
+        engine.set_state(initial_state);
+    }
+
+    info!("Engine continuous event loop started. Polling quotes every 200ms...");
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    let mut tick_count: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown signal received (Ctrl+C). Stopping engine gracefully.");
+                break;
+            }
+            _ = interval.tick() => {
+                tick_count += 1;
+                match executor.fetch_quotes(&config.strategy.symbol_hl, &config.strategy.symbol_bn).await {
+                    Ok((q_hl, q_bn)) => {
+                        let avg_mid = (q_hl.ask_price + q_bn.bid_price) / rust_decimal_macros::dec!(2.0);
+                        let spread_bps = if avg_mid > rust_decimal::Decimal::ZERO {
+                            ((q_bn.bid_price - q_hl.ask_price) / avg_mid) * rust_decimal_macros::dec!(10000.0)
+                        } else {
+                            rust_decimal::Decimal::ZERO
+                        };
+
+                        if tick_count % 30 == 0 {
+                            info!(
+                                tick = tick_count,
+                                state = ?engine.state(),
+                                pos_hl = %engine.snapshot().pos_hl.net_qty,
+                                pos_bn = %engine.snapshot().pos_bn.net_qty,
+                                hl_ask = %q_hl.ask_price,
+                                bn_bid = %q_bn.bid_price,
+                                spread_bps = %format!("{:.2}", spread_bps),
+                                "[HEARTBEAT] Engine running normally"
+                            );
+                        }
+
+                        if let Err(e) = engine.process_quote(&q_hl).await {
+                            tracing::warn!(error = %e, "Engine error processing HL quote");
+                        }
+                        if let Err(e) = engine.process_quote(&q_bn).await {
+                            tracing::warn!(error = %e, "Engine error processing BN quote");
+                        }
+                    }
+                    Err(e) => {
+                        if tick_count % 30 == 0 {
+                            tracing::warn!(error = %e, "Failed to fetch quotes from venues");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Arbitrage Engine shut down safely.");
     Ok(())
 }
 

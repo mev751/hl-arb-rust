@@ -17,6 +17,7 @@ pub struct ArbitrageEngine<E: ExecutionClient + ?Sized> {
     snapshot: EngineSnapshot,
     symbol_hl: String,
     symbol_bn: String,
+    accumulated_fees: Decimal,
 }
 
 impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
@@ -39,6 +40,7 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
             snapshot,
             symbol_hl,
             symbol_bn,
+            accumulated_fees: Decimal::ZERO,
         }
     }
 
@@ -57,6 +59,8 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
 
     pub fn restore_snapshot(&mut self, snapshot: EngineSnapshot) {
         self.strategy.set_state(snapshot.state);
+        self.strategy
+            .sync_positions(snapshot.pos_hl.net_qty, snapshot.pos_bn.net_qty);
         self.snapshot = snapshot;
     }
 
@@ -210,6 +214,7 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                             }
                             self.snapshot.pos_hl.apply_fill(&hl_fill);
                             self.risk.commit_fill(hl_fill.qty);
+                            self.accumulated_fees += hl_fill.fee;
 
                             // Feed fill to strategy -> triggers immediate Hedge signal
                             if let Some(hedge_sig) = self.strategy.on_fill(&hl_fill) {
@@ -286,6 +291,7 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                                 wal.log_fill(&bn_fill)?;
                             }
                             self.snapshot.pos_bn.apply_fill(&bn_fill);
+                            self.accumulated_fees += bn_fill.fee;
 
                             // Inform strategy that hedge fill is secured
                             self.strategy.on_fill(&bn_fill);
@@ -316,11 +322,15 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                 } => {
                     let hl_qty_to_close = self.snapshot.pos_hl.net_qty.abs();
                     let bn_qty_to_close = self.snapshot.pos_bn.net_qty.abs();
+                    let entry_hl_price = self.snapshot.pos_hl.entry_price;
+                    let entry_bn_price = self.snapshot.pos_bn.entry_price;
 
                     info!(
                         session_id = %session_id,
                         hl_qty = %hl_qty_to_close,
                         bn_qty = %bn_qty_to_close,
+                        entry_hl = %entry_hl_price,
+                        entry_bn = %entry_bn_price,
                         spread = %current_spread_bps,
                         "Unwinding cross-venue positions (Exit)"
                     );
@@ -346,7 +356,6 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
 
                     let (hl_fill_res, bn_fill_res) = tokio::join!(hl_fut, bn_fut);
 
-                    let mut total_fees = Decimal::ZERO;
                     let mut hl_price = Decimal::ZERO;
                     let mut bn_price = Decimal::ZERO;
 
@@ -355,7 +364,7 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                             Ok(fill) => {
                                 info!("HL position closed: qty={} price={}", fill.qty, fill.price);
                                 self.snapshot.pos_hl.apply_fill(&fill);
-                                total_fees += fill.fee;
+                                self.accumulated_fees += fill.fee;
                                 hl_price = fill.price;
                             }
                             Err(e) => error!(error = %e, "Failed to close HL position on exit"),
@@ -367,7 +376,7 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                             Ok(fill) => {
                                 info!("BN position closed: qty={} price={}", fill.qty, fill.price);
                                 self.snapshot.pos_bn.apply_fill(&fill);
-                                total_fees += fill.fee;
+                                self.accumulated_fees += fill.fee;
                                 bn_price = fill.price;
                             }
                             Err(e) => error!(error = %e, "Failed to close BN position on exit"),
@@ -379,28 +388,71 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                         self.set_state(StrategyState::Idle);
 
                         let close_qty = hl_qty_to_close.max(bn_qty_to_close);
+                        let hl_pnl = if entry_hl_price > Decimal::ZERO {
+                            (hl_price - entry_hl_price) * close_qty
+                        } else {
+                            Decimal::ZERO
+                        };
+                        let bn_pnl = if entry_bn_price > Decimal::ZERO {
+                            (entry_bn_price - bn_price) * close_qty
+                        } else {
+                            Decimal::ZERO
+                        };
+                        let gross_pnl = hl_pnl + bn_pnl;
+                        let total_roundtrip_fees = self.accumulated_fees;
+                        let net_pnl = gross_pnl - total_roundtrip_fees;
+                        self.accumulated_fees = Decimal::ZERO;
+
+                        let outcome = if net_pnl > Decimal::ZERO { "WIN" } else { "LOSS" };
+
                         let trade = TradeRoundTrip {
                             trade_id: format!("trade_{}", session_id),
                             symbol_hl: self.symbol_hl.clone(),
                             symbol_bn: self.symbol_bn.clone(),
-                            entry_hl_price: hl_price,
-                            entry_bn_price: bn_price,
+                            entry_hl_price,
+                            entry_bn_price,
                             entry_qty: close_qty,
                             exit_hl_price: Some(hl_price),
                             exit_bn_price: Some(bn_price),
                             exit_qty: Some(close_qty),
                             entry_basis_bps: current_spread_bps,
                             exit_basis_bps: Some(current_spread_bps),
-                            gross_pnl_usdt: Decimal::ZERO,
-                            total_fees_usdt: total_fees,
-                            net_pnl_usdt: -total_fees,
+                            gross_pnl_usdt: gross_pnl,
+                            total_fees_usdt: total_roundtrip_fees,
+                            net_pnl_usdt: net_pnl,
                             entry_time_ns: unix_now_ns(),
                             exit_time_ns: Some(unix_now_ns()),
                         };
+
+                        info!("==================================================");
+                        info!(
+                            outcome = outcome,
+                            trade_id = %trade.trade_id,
+                            gross_pnl = %trade.gross_pnl_usdt,
+                            total_fees = %trade.total_fees_usdt,
+                            net_pnl = %trade.net_pnl_usdt,
+                            "[TRADE {}] Net PnL: {} USDT | Gross PnL: {} USDT | Total Fees: {} USDT",
+                            outcome, net_pnl, gross_pnl, total_roundtrip_fees
+                        );
+                        info!("  * Outcome         : [{}]", outcome);
+                        info!("  * Traded Size     : {} tokens", close_qty);
+                        info!(
+                            "  * HL Leg (Buy -> Sell) : {} -> {} (Gross PnL: {:.5} USDT)",
+                            entry_hl_price, hl_price, hl_pnl
+                        );
+                        info!(
+                            "  * BN Leg (Sell -> Buy) : {} -> {} (Gross PnL: {:.5} USDT)",
+                            entry_bn_price, bn_price, bn_pnl
+                        );
+                        info!("  * Total Fees      : {} USDT", total_roundtrip_fees);
+                        info!("  * Net PnL (Real)  : {} USDT", net_pnl);
+                        info!("==================================================");
+
                         let mut wal = self.wal.lock();
                         wal.log_trade(&trade)?;
                         self.snapshot.completed_trades.push(trade);
-                        self.snapshot.total_fees_usdt += total_fees;
+                        self.snapshot.total_fees_usdt += total_roundtrip_fees;
+                        self.snapshot.total_realized_pnl_usdt += net_pnl;
                         wal.save_state(&self.snapshot)?;
                     } else {
                         error!("Position remaining after exit attempt. pos_hl={} pos_bn={}", self.snapshot.pos_hl.net_qty, self.snapshot.pos_bn.net_qty);

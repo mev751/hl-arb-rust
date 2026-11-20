@@ -38,6 +38,43 @@ impl DryRunExecutor {
 
 #[async_trait]
 impl ExecutionClient for DryRunExecutor {
+    async fn fetch_quotes(
+        &self,
+        symbol_hl: &str,
+        symbol_bn: &str,
+    ) -> Result<(L1Quote, L1Quote), ExecutionError> {
+        let state = self.state.read();
+        let q_hl = state
+            .quotes
+            .get(&(VenueId::Hyperliquid, symbol_hl.to_string()))
+            .cloned()
+            .unwrap_or_else(|| L1Quote {
+                venue: VenueId::Hyperliquid,
+                symbol: symbol_hl.to_string(),
+                bid_price: dec!(100.00),
+                bid_qty: dec!(100),
+                ask_price: dec!(100.01),
+                ask_qty: dec!(100),
+                timestamp_ns: unix_now_ns(),
+                local_recv_ns: unix_now_ns(),
+            });
+        let q_bn = state
+            .quotes
+            .get(&(VenueId::BinanceFutures, symbol_bn.to_string()))
+            .cloned()
+            .unwrap_or_else(|| L1Quote {
+                venue: VenueId::BinanceFutures,
+                symbol: symbol_bn.to_string(),
+                bid_price: dec!(100.04),
+                bid_qty: dec!(100),
+                ask_price: dec!(100.05),
+                ask_qty: dec!(100),
+                timestamp_ns: unix_now_ns(),
+                local_recv_ns: unix_now_ns(),
+            });
+        Ok((q_hl, q_bn))
+    }
+
     async fn submit_hl_ioc(
         &self,
         symbol: &str,

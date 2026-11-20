@@ -55,7 +55,17 @@ impl CrossVenueArbStrategy {
     }
 
     pub fn set_state(&mut self, state: StrategyState) {
+        if state == StrategyState::Idle {
+            self.current_hl_pos = Decimal::ZERO;
+            self.current_bn_pos = Decimal::ZERO;
+            self.active_session_id = None;
+        }
         self.state = state;
+    }
+
+    pub fn sync_positions(&mut self, hl_pos: Decimal, bn_pos: Decimal) {
+        self.current_hl_pos = hl_pos;
+        self.current_bn_pos = bn_pos;
     }
 }
 
@@ -187,7 +197,57 @@ impl ArbitrageStrategy for CrossVenueArbStrategy {
                         current_spread_bps,
                     })
                 } else {
-                    None
+                    // Check if we can scale into more position if spread is still >= entry_spread_bps
+                    let exec_spread_bps =
+                        compute_long_hl_exec_spread_bps(hl_quote.ask_price, bn_quote.bid_price, avg_mid)?;
+                    let net_edge_bps =
+                        compute_net_edge_bps(exec_spread_bps, self.config.roundtrip_fees_bps);
+
+                    if exec_spread_bps >= self.config.entry_spread_bps && net_edge_bps > Decimal::ZERO {
+                        let raw_qty = match self.config.order_chunk_notional_usd {
+                            Some(notional) if notional > Decimal::ZERO => {
+                                notional / hl_quote.ask_price
+                            }
+                            _ => self.config.order_chunk_qty,
+                        };
+                        let target_qty = quantize_qty(raw_qty, self.config.hl_step_size);
+                        if target_qty > Decimal::ZERO
+                            && (self.current_hl_pos.abs() + target_qty) <= self.config.max_position_qty
+                        {
+                            let hl_limit_price = compute_hl_ioc_limit_price(
+                                hl_quote.ask_price,
+                                self.config.hl_slippage_bps,
+                                self.config.hl_tick_size,
+                                true,
+                            );
+
+                            let session_id = uuid::Uuid::new_v4().to_string();
+                            self.active_session_id = Some(session_id.clone());
+                            self.state = StrategyState::HlSubmitting;
+
+                            info!(
+                                session_id = %session_id,
+                                exec_spread = %exec_spread_bps,
+                                current_pos = %self.current_hl_pos,
+                                target_qty = %target_qty,
+                                max_pos = %self.config.max_position_qty,
+                                "Scaling into position: Buy HL IOC, prepare Sell BN hedge"
+                            );
+
+                            Some(StrategySignal::Enter {
+                                session_id,
+                                leg_hl_side: OrderSide::Buy,
+                                leg_bn_side: OrderSide::Sell,
+                                target_qty,
+                                target_spread_bps: exec_spread_bps,
+                                hl_limit_price,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 }
             }
             _ => None,

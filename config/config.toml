@@ -1,19 +1,19 @@
 [engine]
-dry_run = true
+dry_run = false
 wal_dir = "data/wal"
 log_level = "info"
 
 [strategy]
 symbol_hl = "xyz:SKHY"
 symbol_bn = "SKHYUSDT"
-entry_spread_bps = 50.0
-exit_spread_bps = 10.0
+entry_spread_bps = 30.0
+exit_spread_bps = 15.0
 # 指定每边下单参数（二选一）：
 # 1) order_chunk_notional_usd: 每边下单金额 (USDT/USD)，策略根据市价自动换算为币数 (如 100 USDT)
-order_chunk_notional_usd = 100.0
+# order_chunk_notional_usd = 100.0
 # 2) order_chunk_qty: 每边下单的固定币数 (若未设置 notional_usd 则使用此项)
-order_chunk_qty = 10.0
-max_position_qty = 100.0
+order_chunk_qty = 0.1
+max_position_qty = 3.0
 hl_slippage_bps = 10.0
 hl_tick_size = 0.01
 hl_step_size = 0.1
@@ -21,8 +21,8 @@ bn_step_size = 0.1
 roundtrip_fees_bps = 12.0
 
 [risk]
-max_position_qty = 100.0
-max_order_chunk_qty = 10.0
+max_position_qty = 3.0
+max_order_chunk_qty = 0.1
 max_unhedged_qty = 1.0
 max_drawdown_usdt = 500.0
 max_consecutive_failures = 3

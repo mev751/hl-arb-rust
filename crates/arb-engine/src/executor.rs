@@ -26,6 +26,12 @@ pub enum ExecutionError {
 
 #[async_trait]
 pub trait ExecutionClient: Send + Sync {
+    async fn fetch_quotes(
+        &self,
+        symbol_hl: &str,
+        symbol_bn: &str,
+    ) -> Result<(arb_core::L1Quote, arb_core::L1Quote), ExecutionError>;
+
     async fn submit_hl_ioc(
         &self,
         symbol: &str,
@@ -59,6 +65,14 @@ pub trait ExecutionClient: Send + Sync {
 
 #[async_trait]
 impl<T: ExecutionClient + ?Sized> ExecutionClient for std::sync::Arc<T> {
+    async fn fetch_quotes(
+        &self,
+        symbol_hl: &str,
+        symbol_bn: &str,
+    ) -> Result<(arb_core::L1Quote, arb_core::L1Quote), ExecutionError> {
+        (**self).fetch_quotes(symbol_hl, symbol_bn).await
+    }
+
     async fn submit_hl_ioc(
         &self,
         symbol: &str,

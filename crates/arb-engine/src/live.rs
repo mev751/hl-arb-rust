@@ -412,6 +412,14 @@ pub fn sign_phantom_agent(
 
 #[async_trait]
 impl ExecutionClient for LiveExecutor {
+    async fn fetch_quotes(
+        &self,
+        symbol_hl: &str,
+        symbol_bn: &str,
+    ) -> Result<(arb_core::L1Quote, arb_core::L1Quote), ExecutionError> {
+        self.fetch_live_quotes(symbol_hl, symbol_bn).await
+    }
+
     async fn submit_hl_ioc(
         &self,
         symbol: &str,
