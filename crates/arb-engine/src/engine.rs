@@ -325,21 +325,26 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                         "Unwinding cross-venue positions (Exit)"
                     );
 
-                    // Close HL if open
-                    let hl_fill_res = if hl_qty_to_close > Decimal::ZERO {
-                        let hl_cl_id = format!("exit_hl_{}", unix_now_ns());
-                        Some(self.executor.submit_hl_ioc(&self.symbol_hl, leg_hl_side, hl_qty_to_close, Decimal::ZERO, &hl_cl_id).await)
-                    } else {
-                        None
+                    // Concurrently close both venues with tokio::join! to eliminate sequential lag
+                    let hl_fut = async {
+                        if hl_qty_to_close > Decimal::ZERO {
+                            let hl_cl_id = format!("exit_hl_{}", unix_now_ns());
+                            Some(self.executor.submit_hl_ioc(&self.symbol_hl, leg_hl_side, hl_qty_to_close, Decimal::ZERO, &hl_cl_id).await)
+                        } else {
+                            None
+                        }
                     };
 
-                    // Close BN if open
-                    let bn_fill_res = if bn_qty_to_close > Decimal::ZERO {
-                        let bn_cl_id = format!("exit_bn_{}", unix_now_ns());
-                        Some(self.executor.submit_bn_market(&self.symbol_bn, leg_bn_side, bn_qty_to_close, &bn_cl_id).await)
-                    } else {
-                        None
+                    let bn_fut = async {
+                        if bn_qty_to_close > Decimal::ZERO {
+                            let bn_cl_id = format!("exit_bn_{}", unix_now_ns());
+                            Some(self.executor.submit_bn_market(&self.symbol_bn, leg_bn_side, bn_qty_to_close, &bn_cl_id).await)
+                        } else {
+                            None
+                        }
                     };
+
+                    let (hl_fill_res, bn_fill_res) = tokio::join!(hl_fut, bn_fut);
 
                     let mut total_fees = Decimal::ZERO;
                     let mut hl_price = Decimal::ZERO;
