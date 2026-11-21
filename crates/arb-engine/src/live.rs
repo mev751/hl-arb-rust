@@ -573,7 +573,7 @@ impl ExecutionClient for LiveExecutor {
                     let oid = filled.get("oid").and_then(|o| o.as_i64()).unwrap_or(0);
 
                     let notional = avg_px * total_sz;
-                    let fee = notional * Decimal::new(86, 5); // 0.86 bps taker fee
+                    let fee = notional * Decimal::new(86, 6); // 0.0086% (0.86 bps) taker fee
 
                     info!(
                         symbol = symbol,
