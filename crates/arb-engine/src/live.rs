@@ -551,6 +551,9 @@ impl ExecutionClient for LiveExecutor {
         if let Some(arr) = statuses {
             if let Some(first) = arr.first() {
                 if let Some(err_msg) = first.get("error").and_then(|e| e.as_str()) {
+                    if err_msg.contains("could not immediately match") || err_msg.to_lowercase().contains("zero fill") {
+                        return Err(ExecutionError::ZeroFill);
+                    }
                     return Err(ExecutionError::Rejected(format!("HL order error: {}", err_msg)));
                 }
 

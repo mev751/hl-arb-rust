@@ -64,6 +64,10 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
         self.snapshot = snapshot;
     }
 
+    pub fn reset_circuit_breaker(&self) {
+        self.risk.reset_circuit_breaker();
+    }
+
     /// Manually flatten and close any open positions across both venues.
     pub async fn manual_close(&mut self) -> Result<Option<TradeRoundTrip>, anyhow::Error> {
         let hl_qty = self.snapshot.pos_hl.net_qty;

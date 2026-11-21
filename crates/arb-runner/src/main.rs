@@ -116,6 +116,9 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
         engine.set_state(initial_state);
     }
 
+    engine.reset_circuit_breaker();
+    info!("Risk manager circuit breaker initialized and active.");
+
     info!("Engine continuous event loop started. Polling quotes every 200ms...");
 
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
