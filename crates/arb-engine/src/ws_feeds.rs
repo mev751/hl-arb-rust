@@ -164,7 +164,7 @@ pub fn parse_bn_user_message(txt: &str, expected_symbol_upper: &str) -> Option<B
     }
 }
 
-/// Parse a Hyperliquid `l2Book` WS message into an `L1Quote` (also signals `pong`).
+/// Parse a Hyperliquid `bbo` or `l2Book` WS message into an `L1Quote` (also signals `pong`).
 #[derive(Debug, Clone)]
 pub enum HlMarketMsg {
     Pong,
@@ -172,12 +172,60 @@ pub enum HlMarketMsg {
     Other,
 }
 
+/// Monotonic timestamp filter for merging HL `bbo` (~124ms) and `l2Book(fast=true)` (~500ms).
+/// Drops out-of-order older snapshots while allowing same-timestamp or newer snapshots to
+/// refresh liveness.
+pub fn should_accept_hl_quote(last_ts_ns: &mut u64, ts_ns: u64) -> bool {
+    if ts_ns > 0 && ts_ns < *last_ts_ns {
+        return false;
+    }
+    if ts_ns > *last_ts_ns {
+        *last_ts_ns = ts_ns;
+    }
+    true
+}
+
+fn build_hl_l1_quote(
+    data: &serde_json::Value,
+    configured_symbol: &str,
+    best_bid: &serde_json::Value,
+    best_ask: &serde_json::Value,
+) -> HlMarketMsg {
+    let bid_price = parse_dec_field(best_bid, "px");
+    let bid_qty = parse_dec_field(best_bid, "sz");
+    let ask_price = parse_dec_field(best_ask, "px");
+    let ask_qty = parse_dec_field(best_ask, "sz");
+
+    if bid_price <= Decimal::ZERO || ask_price <= Decimal::ZERO {
+        return HlMarketMsg::Other;
+    }
+
+    let now_ns = unix_now_ns();
+    let ex_ms = data.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
+    let timestamp_ns = if ex_ms > 0 {
+        ex_ms.saturating_mul(1_000_000)
+    } else {
+        now_ns
+    };
+
+    HlMarketMsg::Quote(L1Quote {
+        venue: VenueId::Hyperliquid,
+        symbol: configured_symbol.to_string(),
+        bid_price,
+        bid_qty,
+        ask_price,
+        ask_qty,
+        timestamp_ns,
+        local_recv_ns: now_ns,
+    })
+}
+
 pub fn parse_hl_l2book(txt: &str, configured_symbol: &str) -> Option<HlMarketMsg> {
     let val: serde_json::Value = serde_json::from_str(txt).ok()?;
     let channel = val.get("channel").and_then(|c| c.as_str()).unwrap_or("");
     match channel {
         "pong" => Some(HlMarketMsg::Pong),
-        "l2Book" => {
+        "bbo" | "l2Book" => {
             let data = val.get("data")?;
             let coin = data.get("coin").and_then(|c| c.as_str()).unwrap_or("");
             let clean_cfg = configured_symbol.split(':').last().unwrap_or(configured_symbol);
@@ -185,37 +233,19 @@ pub fn parse_hl_l2book(txt: &str, configured_symbol: &str) -> Option<HlMarketMsg
                 return Some(HlMarketMsg::Other);
             }
 
-            let levels = data.get("levels").and_then(|l| l.as_array())?;
-            let best_bid = levels.first().and_then(|b| b.as_array()).and_then(|a| a.first())?;
-            let best_ask = levels.get(1).and_then(|a| a.as_array()).and_then(|a| a.first())?;
-
-            let bid_price = parse_dec_field(best_bid, "px");
-            let bid_qty = parse_dec_field(best_bid, "sz");
-            let ask_price = parse_dec_field(best_ask, "px");
-            let ask_qty = parse_dec_field(best_ask, "sz");
-
-            if bid_price <= Decimal::ZERO || ask_price <= Decimal::ZERO {
-                return Some(HlMarketMsg::Other);
-            }
-
-            let now_ns = unix_now_ns();
-            let ex_ms = data.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
-            let timestamp_ns = if ex_ms > 0 {
-                ex_ms.saturating_mul(1_000_000)
+            let (best_bid, best_ask) = if channel == "bbo" {
+                let bbo = data.get("bbo").and_then(|b| b.as_array())?;
+                let bid = bbo.first().filter(|v| v.is_object())?;
+                let ask = bbo.get(1).filter(|v| v.is_object())?;
+                (bid, ask)
             } else {
-                now_ns
+                let levels = data.get("levels").and_then(|l| l.as_array())?;
+                let bid = levels.first().and_then(|b| b.as_array()).and_then(|a| a.first())?;
+                let ask = levels.get(1).and_then(|a| a.as_array()).and_then(|a| a.first())?;
+                (bid, ask)
             };
 
-            Some(HlMarketMsg::Quote(L1Quote {
-                venue: VenueId::Hyperliquid,
-                symbol: configured_symbol.to_string(),
-                bid_price,
-                bid_qty,
-                ask_price,
-                ask_qty,
-                timestamp_ns,
-                local_recv_ns: now_ns,
-            }))
+            Some(build_hl_l1_quote(data, configured_symbol, best_bid, best_ask))
         }
         _ => Some(HlMarketMsg::Other),
     }
@@ -436,7 +466,7 @@ pub fn spawn_bn_user_data_feed(
     });
 }
 
-/// Spawn Hyperliquid `l2Book` WebSocket market data feed with 20s JSON ping/pong keepalive.
+/// Spawn Hyperliquid `bbo` + `l2Book(fast=true)` WebSocket market data feed with 20s JSON ping/pong keepalive.
 pub fn spawn_hl_l2book_feed(
     hl_ws_url: String,
     symbol_hl: String,
@@ -447,23 +477,33 @@ pub fn spawn_hl_l2book_feed(
         let mut attempt = 0usize;
 
         loop {
-            info!(url = %hl_ws_url, symbol = %symbol_hl, "Connecting Hyperliquid l2Book WS...");
+            info!(url = %hl_ws_url, symbol = %symbol_hl, "Connecting Hyperliquid market WS (bbo + fast l2Book)...");
             let connected_at = Instant::now();
 
             match connect_async_tls_with_config(hl_ws_url.as_str(), None, true, None).await {
                 Ok((ws_stream, _)) => {
                     let (mut ws_sink, mut ws_rx) = ws_stream.split();
-                    let sub_msg = serde_json::json!({
+                    let sub_bbo = serde_json::json!({
+                        "method": "subscribe",
+                        "subscription": {
+                            "type": "bbo",
+                            "coin": symbol_hl,
+                        }
+                    });
+                    let sub_l2 = serde_json::json!({
                         "method": "subscribe",
                         "subscription": {
                             "type": "l2Book",
                             "coin": symbol_hl,
+                            "fast": true,
                         }
                     });
-                    if let Err(e) = ws_sink.send(Message::Text(sub_msg.to_string())).await {
-                        warn!(error = %e, "Failed to send HL l2Book subscription");
+                    if let Err(e) = ws_sink.send(Message::Text(sub_bbo.to_string())).await {
+                        warn!(error = %e, "Failed to send HL bbo subscription");
+                    } else if let Err(e) = ws_sink.send(Message::Text(sub_l2.to_string())).await {
+                        warn!(error = %e, "Failed to send HL l2Book(fast=true) subscription");
                     } else {
-                        info!(symbol = %symbol_hl, "Hyperliquid l2Book WS connected & subscribed");
+                        info!(symbol = %symbol_hl, "Hyperliquid market WS connected & subscribed (bbo + l2Book fast=true)");
                         if tx
                             .send(EngineEvent::FeedHealth {
                                 feed: FeedKind::HlMarket,
@@ -481,6 +521,7 @@ pub fn spawn_hl_l2book_feed(
                         watchdog_interval.tick().await;
                         let mut awaiting_pong = false;
                         let mut last_ping = Instant::now();
+                        let mut last_ts_ns: u64 = 0;
 
                         loop {
                             tokio::select! {
@@ -493,7 +534,9 @@ pub fn spawn_hl_l2book_feed(
                                                     debug!("HL l2Book WS pong received");
                                                 }
                                                 Some(HlMarketMsg::Quote(q)) => {
-                                                    if tx.send(EngineEvent::Quote(q)).await.is_err() {
+                                                    if should_accept_hl_quote(&mut last_ts_ns, q.timestamp_ns)
+                                                        && tx.send(EngineEvent::Quote(q)).await.is_err()
+                                                    {
                                                         return;
                                                     }
                                                 }
@@ -648,6 +691,45 @@ mod tests {
             }
             other => panic!("Unexpected: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_hl_bbo() {
+        let valid = r#"{"channel":"bbo","data":{"coin":"xyz:SKHY","time":1795323592240,"bbo":[{"px":"106.96","sz":"5.72","n":2},{"px":"106.98","sz":"5.36","n":5}]}}"#;
+        match parse_hl_l2book(valid, "xyz:SKHY").unwrap() {
+            HlMarketMsg::Quote(q) => {
+                assert_eq!(q.venue, VenueId::Hyperliquid);
+                assert_eq!(q.symbol, "xyz:SKHY");
+                assert_eq!(q.bid_price, dec!(106.96));
+                assert_eq!(q.bid_qty, dec!(5.72));
+                assert_eq!(q.ask_price, dec!(106.98));
+                assert_eq!(q.ask_qty, dec!(5.36));
+                assert_eq!(q.timestamp_ns, 1795323592240u64 * 1_000_000);
+            }
+            other => panic!("Unexpected: {:?}", other),
+        }
+
+        let partial_null = r#"{"channel":"bbo","data":{"coin":"xyz:SKHY","time":1795323592240,"bbo":[null,{"px":"106.98","sz":"5.36","n":5}]}}"#;
+        assert!(parse_hl_l2book(partial_null, "xyz:SKHY").is_none());
+    }
+
+    #[test]
+    fn test_should_accept_hl_quote_monotonic() {
+        let mut last_ts = 0u64;
+        assert!(should_accept_hl_quote(&mut last_ts, 1_000_000));
+        assert_eq!(last_ts, 1_000_000);
+
+        // Same timestamp refreshes liveness
+        assert!(should_accept_hl_quote(&mut last_ts, 1_000_000));
+        assert_eq!(last_ts, 1_000_000);
+
+        // Newer timestamp advances watermark
+        assert!(should_accept_hl_quote(&mut last_ts, 2_000_000));
+        assert_eq!(last_ts, 2_000_000);
+
+        // Older out-of-order snapshot is rejected without regressing watermark
+        assert!(!should_accept_hl_quote(&mut last_ts, 1_500_000));
+        assert_eq!(last_ts, 2_000_000);
     }
 
     #[test]
