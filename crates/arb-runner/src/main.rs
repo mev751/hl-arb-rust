@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Check => check_connectivity(config).await?,
         Commands::Reconcile => reconcile_state(config).await?,
         Commands::Close { live } => manual_close(config, live).await?,
+        Commands::Rebalance { live } => rebalance_residual(config, live).await?,
         Commands::TestTrade { size, amount, price, live, close } => test_trade(config, size, amount, price, live, close).await?,
         Commands::Backtest { quotes_file } => backtest_replay(config, quotes_file).await?,
     }
@@ -434,6 +435,131 @@ async fn reconcile_state(config: AppConfig) -> anyhow::Result<()> {
     } else {
         println!("No state snapshot found in {}", config.engine.wal_dir);
     }
+    Ok(())
+}
+
+async fn rebalance_residual(config: AppConfig, force_live: bool) -> anyhow::Result<()> {
+    use arb_core::{
+        clocks::unix_now_ns, compute_hl_ioc_limit_price, quantize_qty, OrderSide, StrategyState,
+    };
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    let is_live = force_live || !config.engine.dry_run;
+    if !is_live {
+        anyhow::bail!("rebalance requires live mode (--live or engine.dry_run=false)");
+    }
+
+    let mut wal = WalManager::new(&config.engine.wal_dir)?;
+    let existing_snapshot = wal.load_state()?;
+    let executor = Arc::new(LiveExecutor::new(build_live_executor_config(&config))?);
+
+    let symbol_hl = &config.strategy.symbol_hl;
+    let symbol_bn = &config.strategy.symbol_bn;
+    let before = StartupReconciler::reconcile_detailed(
+        executor.as_ref(),
+        existing_snapshot.as_ref(),
+        symbol_hl,
+        symbol_bn,
+    )
+    .await?;
+
+    let delta = before.live_hl_pos + before.live_bn_pos;
+    println!("==================================================");
+    println!("=== Rebalancing Cross-Venue Unhedged Residual  ===");
+    println!("==================================================");
+    println!(
+        "Before : state={:?} | live_hl={} | live_bn={} | delta={}",
+        before.initial_state, before.live_hl_pos, before.live_bn_pos, delta
+    );
+
+    if delta.abs() < config.strategy.hl_step_size {
+        println!("Positions are already balanced within step size ({}).", config.strategy.hl_step_size);
+        return Ok(());
+    }
+
+    if delta.abs() > config.risk.max_unhedged_qty {
+        anyhow::bail!(
+            "Residual delta {} exceeds risk.max_unhedged_qty {}",
+            delta,
+            config.risk.max_unhedged_qty
+        );
+    }
+
+    let (q_hl, _q_bn) = executor.fetch_quotes(symbol_hl, symbol_bn).await?;
+    let fill = if delta > Decimal::ZERO && before.live_hl_pos >= delta {
+        let qty = quantize_qty(delta, config.strategy.hl_step_size);
+        let lim = compute_hl_ioc_limit_price(
+            q_hl.bid_price,
+            dec!(50.0),
+            config.strategy.hl_tick_size,
+            false,
+        );
+        let cl_id = format!("rebal_hl_{}", unix_now_ns());
+        println!(
+            "Action : HL IOC reduceOnly=true Sell qty={} limit={} (hl_bid={})",
+            qty, lim, q_hl.bid_price
+        );
+        executor
+            .submit_hl_ioc_with_opts(symbol_hl, OrderSide::Sell, qty, lim, true, &cl_id)
+            .await?
+    } else if delta < Decimal::ZERO
+        && before.live_bn_pos < Decimal::ZERO
+        && before.live_bn_pos.abs() >= delta.abs()
+    {
+        let qty = quantize_qty(delta.abs(), config.strategy.bn_step_size);
+        let cl_id = format!("rebal_bn_{}", unix_now_ns());
+        println!("Action : BN Market reduceOnly=true Buy qty={}", qty);
+        executor
+            .submit_bn_market_with_opts(symbol_bn, OrderSide::Buy, qty, true, &cl_id)
+            .await?
+    } else {
+        anyhow::bail!(
+            "Cannot safely reduce-only rebalance live_hl={} live_bn={}",
+            before.live_hl_pos,
+            before.live_bn_pos
+        );
+    };
+
+    println!(
+        "Filled : venue={} side={:?} qty={} price={} fee={} {}",
+        fill.venue, fill.side, fill.qty, fill.price, fill.fee, fill.fee_asset
+    );
+
+    wal.log_fill(&fill)?;
+    let mut snap = existing_snapshot
+        .unwrap_or_else(|| EngineSnapshot::new(symbol_hl.clone(), symbol_bn.clone()));
+    if fill.venue == arb_core::VenueId::Hyperliquid {
+        snap.pos_hl.apply_fill(&fill);
+    } else {
+        snap.pos_bn.apply_fill(&fill);
+    }
+
+    let after = StartupReconciler::reconcile_detailed(
+        executor.as_ref(),
+        Some(&snap),
+        symbol_hl,
+        symbol_bn,
+    )
+    .await?;
+
+    snap.state = after.initial_state;
+    snap.pos_hl.net_qty = after.live_hl_pos;
+    snap.pos_bn.net_qty = after.live_bn_pos;
+    if matches!(snap.state, StrategyState::Idle) {
+        snap.pos_hl.entry_price = Decimal::ZERO;
+        snap.pos_bn.entry_price = Decimal::ZERO;
+    }
+    wal.save_state(&snap)?;
+
+    println!(
+        "After  : state={:?} | live_hl={} | live_bn={} | residual={}",
+        after.initial_state,
+        after.live_hl_pos,
+        after.live_bn_pos,
+        after.live_hl_pos + after.live_bn_pos
+    );
+    println!("WAL state updated and persisted cleanly.");
     Ok(())
 }
 

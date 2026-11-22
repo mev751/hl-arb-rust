@@ -480,3 +480,134 @@ async fn test_hl_tiered_slippage_retry_recovers_on_third_attempt() -> anyhow::Re
     let _ = std::fs::remove_dir_all(&temp_dir);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_rest_reconcile_and_delayed_ws_trade_no_double_hedge() -> anyhow::Result<()> {
+    let temp_dir = std::env::temp_dir().join(format!("arb_mt_race_{}", uuid::Uuid::new_v4()));
+    let wal = WalManager::new(&temp_dir)?;
+    let exec = Arc::new(DryRunExecutor::new());
+    let mut engine = MakerTakerEngine::new(base_config(), base_risk(), wal, exec.clone());
+    engine.set_all_feeds_healthy(true);
+
+    let now = unix_now_ns();
+    push_quotes(&mut engine, &exec, dec!(99.99), dec!(100.00), dec!(100.28), dec!(100.30), now).await?;
+    let ord = engine.active_bn_order().expect("Entry GTX Sell should be placed").clone();
+
+    // Exchange fills order before cancel arrives, while WS ORDER_TRADE_UPDATE is delayed in transit.
+    exec.apply_bn_order_fill_state("SKHYUSDT", &ord.client_order_id, OrderSide::Sell, dec!(0.1), true);
+
+    // Out-of-range quotes trigger cancel -> OrderNotFound -> REST reconcile records fill and hedges HL 0.1
+    push_quotes(&mut engine, &exec, dec!(99.99), dec!(100.00), dec!(100.18), dec!(100.20), now + 2_000_000_000).await?;
+
+    assert!(engine.active_bn_order().is_none());
+    assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(-0.1));
+    assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(0.1));
+    assert_eq!(exec.query_position(VenueId::Hyperliquid, "xyz:SKHY").await?, dec!(0.1));
+
+    // Delayed WS TRADE arrives AFTER REST reconcile already cleared active_bn_order and hedged HL
+    engine
+        .process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+            symbol: "SKHYUSDT".into(),
+            client_order_id: ord.client_order_id,
+            order_id: 77,
+            side: OrderSide::Sell,
+            exec_type: "TRADE".into(),
+            order_status: "FILLED".into(),
+            last_filled_qty: dec!(0.1),
+            cum_filled_qty: dec!(0.1),
+            last_filled_px: dec!(100.29),
+            avg_price: dec!(100.29),
+            commission: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            is_maker: true,
+            reduce_only: false,
+            trade_id: 9001,
+            event_time_ms: 77,
+        }))
+        .await?;
+
+    // Must NOT double-record BN fill or fire a second HL IOC hedge!
+    assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(0.1));
+    assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(-0.1));
+    assert_eq!(exec.query_position(VenueId::Hyperliquid, "xyz:SKHY").await?, dec!(0.1));
+    assert_eq!(engine.state(), StrategyState::Open);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_partial_fill_rest_reconcile_and_delayed_ws_no_double_count() -> anyhow::Result<()> {
+    let temp_dir = std::env::temp_dir().join(format!("arb_mt_prace_{}", uuid::Uuid::new_v4()));
+    let wal = WalManager::new(&temp_dir)?;
+    let exec = Arc::new(DryRunExecutor::new());
+    let mut engine = MakerTakerEngine::new(base_config(), base_risk(), wal, exec.clone());
+    engine.set_all_feeds_healthy(true);
+
+    let now = unix_now_ns();
+    push_quotes(&mut engine, &exec, dec!(99.99), dec!(100.00), dec!(100.28), dec!(100.30), now).await?;
+    let ord = engine.active_bn_order().expect("Entry GTX Sell should be placed").clone();
+
+    // Step 1: Partial fill 0.04 arrives normally via WS
+    exec.apply_bn_order_fill_state("SKHYUSDT", &ord.client_order_id, OrderSide::Sell, dec!(0.04), false);
+    engine
+        .process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+            symbol: "SKHYUSDT".into(),
+            client_order_id: ord.client_order_id.clone(),
+            order_id: 88,
+            side: OrderSide::Sell,
+            exec_type: "TRADE".into(),
+            order_status: "PARTIALLY_FILLED".into(),
+            last_filled_qty: dec!(0.04),
+            cum_filled_qty: dec!(0.04),
+            last_filled_px: dec!(100.29),
+            avg_price: dec!(100.29),
+            commission: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            is_maker: true,
+            reduce_only: false,
+            trade_id: 9101,
+            event_time_ms: 88,
+        }))
+        .await?;
+
+    assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(-0.04));
+    assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(0));
+
+    // Step 2: Remaining 0.06 fills on exchange; cancel races -> OrderNotFound -> REST reconcile records 0.06 & hedges 0.1
+    exec.apply_bn_order_fill_state("SKHYUSDT", &ord.client_order_id, OrderSide::Sell, dec!(0.06), true);
+    push_quotes(&mut engine, &exec, dec!(99.99), dec!(100.00), dec!(100.18), dec!(100.20), now + 2_000_000_000).await?;
+
+    assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(-0.1));
+    assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(0.1));
+    assert_eq!(exec.query_position(VenueId::Hyperliquid, "xyz:SKHY").await?, dec!(0.1));
+
+    // Step 3: Delayed WS TRADE for the 0.06 leg arrives after REST reconcile
+    engine
+        .process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+            symbol: "SKHYUSDT".into(),
+            client_order_id: ord.client_order_id,
+            order_id: 88,
+            side: OrderSide::Sell,
+            exec_type: "TRADE".into(),
+            order_status: "FILLED".into(),
+            last_filled_qty: dec!(0.06),
+            cum_filled_qty: dec!(0.10),
+            last_filled_px: dec!(100.29),
+            avg_price: dec!(100.29),
+            commission: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            is_maker: true,
+            reduce_only: false,
+            trade_id: 9102,
+            event_time_ms: 89,
+        }))
+        .await?;
+
+    assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(0.1));
+    assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(-0.1));
+    assert_eq!(exec.query_position(VenueId::Hyperliquid, "xyz:SKHY").await?, dec!(0.1));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(())
+}

@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -101,6 +101,8 @@ pub struct MakerTakerEngine<E: ExecutionClient + ?Sized> {
     last_order_action_ms: u64,
     seen_trade_ids: HashSet<(i64, i64)>,
     seen_trade_ring: VecDeque<(i64, i64)>,
+    order_accounted_qty: HashMap<String, Decimal>,
+    order_accounted_ring: VecDeque<String>,
 
     // Rolling EMA basis tracker (event-time driven)
     ema_basis_bps: Option<f64>,
@@ -137,6 +139,8 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             last_order_action_ms: 0,
             seen_trade_ids: HashSet::new(),
             seen_trade_ring: VecDeque::new(),
+            order_accounted_qty: HashMap::new(),
+            order_accounted_ring: VecDeque::new(),
             ema_basis_bps: None,
             last_ema_event_ms: 0,
             latest_mid_basis_bps: Decimal::ZERO,
@@ -626,6 +630,38 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         }
     }
 
+    fn order_tracking_key(client_order_id: &str, order_id: i64) -> String {
+        if !client_order_id.is_empty() {
+            client_order_id.to_string()
+        } else {
+            format!("oid_{}", order_id)
+        }
+    }
+
+    fn order_accounted_qty(&self, key: &str) -> Decimal {
+        self.order_accounted_qty
+            .get(key)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    fn record_order_accounted_qty(&mut self, key: &str, new_cum: Decimal) {
+        let prev = self.order_accounted_qty(key);
+        if new_cum <= prev {
+            return;
+        }
+        let is_new = !self.order_accounted_qty.contains_key(key);
+        self.order_accounted_qty.insert(key.to_string(), new_cum);
+        if is_new {
+            self.order_accounted_ring.push_back(key.to_string());
+            while self.order_accounted_ring.len() > SEEN_TRADES_CAP {
+                if let Some(old) = self.order_accounted_ring.pop_front() {
+                    self.order_accounted_qty.remove(&old);
+                }
+            }
+        }
+    }
+
     async fn reconcile_bn_order_via_rest(&mut self) {
         let Some(active) = self.active_bn_order.clone() else {
             return;
@@ -640,8 +676,11 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                     ack.status.as_str(),
                     "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED"
                 );
-                if ack.executed_qty > active.cum_filled_qty {
-                    let missing = ack.executed_qty - active.cum_filled_qty;
+                let key = Self::order_tracking_key(&active.client_order_id, ack.order_id);
+                let prev_accounted = self.order_accounted_qty(&key).max(active.cum_filled_qty);
+                if ack.executed_qty > prev_accounted {
+                    let missing = ack.executed_qty - prev_accounted;
+                    self.record_order_accounted_qty(&key, ack.executed_qty);
                     let synthetic = FillEvent {
                         fill_id: format!("bn_reconcile_{}_{}", ack.order_id, unix_now_ns()),
                         client_order_id: active.client_order_id.clone(),
@@ -661,6 +700,8 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                     if let Some(ref mut cur) = self.active_bn_order {
                         cur.cum_filled_qty = ack.executed_qty;
                     }
+                } else if prev_accounted > Decimal::ZERO {
+                    self.record_order_accounted_qty(&key, prev_accounted);
                 }
                 if terminal {
                     self.active_bn_order = None;
@@ -681,6 +722,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
     }
 
     async fn on_bn_order_update(&mut self, upd: BnOrderUpdate) -> Result<(), anyhow::Error> {
+        let key = Self::order_tracking_key(&upd.client_order_id, upd.order_id);
         let matches_active = self
             .active_bn_order
             .as_ref()
@@ -701,32 +743,46 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                     }
                 }
 
-                let px = if upd.last_filled_px > Decimal::ZERO {
-                    upd.last_filled_px
+                let prev_accounted = self.order_accounted_qty(&key);
+                let effective_cum = if upd.cum_filled_qty > Decimal::ZERO {
+                    upd.cum_filled_qty
                 } else {
-                    upd.avg_price
+                    prev_accounted + upd.last_filled_qty
                 };
-                let fill = FillEvent {
-                    fill_id: format!("bn_{}_{}", upd.order_id, upd.trade_id),
-                    client_order_id: upd.client_order_id.clone(),
-                    venue: VenueId::BinanceFutures,
-                    symbol: self.config.symbol_bn.clone(),
-                    side: upd.side,
-                    price: px,
-                    qty: upd.last_filled_qty,
-                    fee: upd.commission,
-                    fee_asset: upd.commission_asset.clone(),
-                    is_maker: upd.is_maker,
-                    timestamp_ns: unix_now_ns(),
-                };
-                self.record_bn_fill(fill)?;
 
-                if matches_active {
-                    if let Some(ref mut act) = self.active_bn_order {
-                        if upd.cum_filled_qty > act.cum_filled_qty {
-                            act.cum_filled_qty = upd.cum_filled_qty;
-                        } else {
-                            act.cum_filled_qty += upd.last_filled_qty;
+                if effective_cum <= prev_accounted {
+                    debug!(
+                        key = %key,
+                        cum = %effective_cum,
+                        prev = %prev_accounted,
+                        "Ignoring already-accounted BN WS TRADE update"
+                    );
+                } else {
+                    let delta_qty = effective_cum - prev_accounted;
+                    self.record_order_accounted_qty(&key, effective_cum);
+                    let px = if upd.last_filled_px > Decimal::ZERO {
+                        upd.last_filled_px
+                    } else {
+                        upd.avg_price
+                    };
+                    let fill = FillEvent {
+                        fill_id: format!("bn_{}_{}", upd.order_id, upd.trade_id),
+                        client_order_id: upd.client_order_id.clone(),
+                        venue: VenueId::BinanceFutures,
+                        symbol: self.config.symbol_bn.clone(),
+                        side: upd.side,
+                        price: px,
+                        qty: delta_qty,
+                        fee: upd.commission,
+                        fee_asset: upd.commission_asset.clone(),
+                        is_maker: upd.is_maker,
+                        timestamp_ns: unix_now_ns(),
+                    };
+                    self.record_bn_fill(fill)?;
+
+                    if matches_active {
+                        if let Some(ref mut act) = self.active_bn_order {
+                            act.cum_filled_qty = act.cum_filled_qty.max(effective_cum);
                         }
                     }
                 }
@@ -741,8 +797,10 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         if is_terminal && matches_active {
             if let Some(active) = self.active_bn_order.take() {
                 // Reconcile any fill missed prior to terminal event
-                if upd.cum_filled_qty > active.cum_filled_qty {
-                    let missing = upd.cum_filled_qty - active.cum_filled_qty;
+                let prev_accounted = self.order_accounted_qty(&key).max(active.cum_filled_qty);
+                if upd.cum_filled_qty > prev_accounted {
+                    let missing = upd.cum_filled_qty - prev_accounted;
+                    self.record_order_accounted_qty(&key, upd.cum_filled_qty);
                     let px = if upd.avg_price > Decimal::ZERO {
                         upd.avg_price
                     } else if upd.last_filled_px > Decimal::ZERO {
@@ -967,6 +1025,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                     .await
                 {
                     Ok(u_fill) => {
+                        self.record_order_accounted_qty(&cl_unwind, u_fill.qty);
                         let _ = self.wal.lock().log_fill(&u_fill);
                         self.round.total_fees += u_fill.fee;
                         self.snapshot.pos_bn.apply_fill(&u_fill);
@@ -1044,6 +1103,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                 .await
             {
                 Ok(fill) => {
+                    self.record_order_accounted_qty(&cl_id, fill.qty);
                     {
                         let mut wal = self.wal.lock();
                         wal.log_fill(&fill)?;
@@ -1123,6 +1183,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                 .submit_bn_market_with_opts(&self.config.symbol_bn, side, bn_qty.abs(), true, &cl_bn)
                 .await
             {
+                self.record_order_accounted_qty(&cl_bn, f.qty);
                 let _ = self.wal.lock().log_fill(&f);
                 if side == OrderSide::Buy {
                     self.round.exit_bn_notional += f.qty * f.price;

@@ -30,6 +30,13 @@ pub enum Commands {
         live: bool,
     },
 
+    /// Rebalance an unhedged residual delta on whichever leg has excess position (reduceOnly)
+    Rebalance {
+        /// Force LIVE execution mode (sends real reduceOnly order to flatten excess residual)
+        #[arg(long, default_value_t = false)]
+        live: bool,
+    },
+
     /// Test two-leg order placement with a specified quantity (size) or notional amount (USDT/USD)
     TestTrade {
         /// Order size / token quantity to trade on each side (e.g. --size 2.5)
