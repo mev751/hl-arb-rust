@@ -29,6 +29,18 @@ pub struct LiveExecutorConfig {
     pub hl_dex: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CachedHlIoc {
+    pub symbol: String,
+    pub side: OrderSide,
+    pub qty: Decimal,
+    pub limit_price: Decimal,
+    pub reduce_only: bool,
+    pub nonce: u64,
+    pub payload: serde_json::Value,
+    pub generated_at: std::time::Instant,
+}
+
 pub struct LiveExecutor {
     http: reqwest::Client,
     config: LiveExecutorConfig,
@@ -37,6 +49,7 @@ pub struct LiveExecutor {
     hl_master_wallet: parking_lot::RwLock<Option<String>>,
     hl_trade_ws: parking_lot::RwLock<Option<HlWsTradeClient>>,
     last_nonce: AtomicU64,
+    cached_ioc: parking_lot::RwLock<Option<CachedHlIoc>>,
 }
 
 impl LiveExecutor {
@@ -69,6 +82,7 @@ impl LiveExecutor {
             hl_master_wallet: parking_lot::RwLock::new(None),
             hl_trade_ws: parking_lot::RwLock::new(None),
             last_nonce: AtomicU64::new(now_ms),
+            cached_ioc: parking_lot::RwLock::new(None),
         })
     }
 
@@ -637,6 +651,56 @@ impl LiveExecutor {
             Ok(limit_price)
         }
     }
+    pub fn build_signed_hl_ioc_payload(
+        &self,
+        _symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        effective_limit_price: Decimal,
+        reduce_only: bool,
+        asset_id: u64,
+        sz_decimals: u32,
+    ) -> Result<(serde_json::Value, u64), ExecutionError> {
+        let signing_key = self
+            .hl_signing_key
+            .as_ref()
+            .ok_or_else(|| ExecutionError::Other("Hyperliquid private key is missing or not configured".into()))?;
+
+        let is_buy = side == OrderSide::Buy;
+        let px_str = format_hl_price(effective_limit_price, sz_decimals);
+        let qty_str = format_hl_qty(qty, sz_decimals);
+
+        let action = HlOrderAction {
+            action_type: "order",
+            orders: vec![HlOrderWire {
+                a: asset_id,
+                b: is_buy,
+                p: &px_str,
+                s: &qty_str,
+                r: reduce_only,
+                t: HlOrderTypeWire {
+                    limit: HlLimitOrderWire { tif: "Ioc" },
+                },
+                c: None,
+            }],
+            grouping: "na",
+        };
+
+        let nonce = self.next_nonce();
+        let conn_id = build_l1_action_hash(&action, nonce)
+            .map_err(|e| ExecutionError::Other(format!("Build action hash failed: {}", e)))?;
+
+        let signature = sign_phantom_agent(signing_key, &conn_id, self.config.hl_is_mainnet)
+            .map_err(|e| ExecutionError::Other(format!("EIP-712 signing failed: {}", e)))?;
+
+        let payload = serde_json::json!({
+            "action": action,
+            "nonce": nonce,
+            "signature": signature,
+        });
+
+        Ok((payload, nonce))
+    }
 }
 
 /// Parse a Hyperliquid `/exchange` or WS `post` order response payload into a `FillEvent`.
@@ -736,6 +800,71 @@ impl ExecutionClient for LiveExecutor {
         self.fetch_live_quotes(symbol_hl, symbol_bn).await
     }
 
+    async fn prepare_hl_ioc_cache(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        limit_price: Decimal,
+        reduce_only: bool,
+    ) {
+        if self.hl_signing_key.is_none() || limit_price <= Decimal::ZERO || qty <= Decimal::ZERO {
+            return;
+        }
+
+        // Fast check if current cache is already fresh and matches
+        {
+            let cache = self.cached_ioc.read();
+            if let Some(c) = cache.as_ref() {
+                let same_target = c.symbol == symbol && c.side == side && c.qty == qty && c.reduce_only == reduce_only;
+                let price_close = (c.limit_price - limit_price).abs() <= Decimal::ZERO;
+                let fresh = c.generated_at.elapsed() < Duration::from_millis(1500);
+                if same_target && price_close && fresh {
+                    return;
+                }
+            }
+        }
+
+        let Ok((asset_id, sz_decimals)) = self.resolve_hl_asset_info(symbol).await else {
+            return;
+        };
+
+        match self.build_signed_hl_ioc_payload(
+            symbol,
+            side,
+            qty,
+            limit_price,
+            reduce_only,
+            asset_id,
+            sz_decimals,
+        ) {
+            Ok((payload, nonce)) => {
+                let item = CachedHlIoc {
+                    symbol: symbol.to_string(),
+                    side,
+                    qty,
+                    limit_price,
+                    reduce_only,
+                    nonce,
+                    payload,
+                    generated_at: std::time::Instant::now(),
+                };
+                *self.cached_ioc.write() = Some(item);
+                debug!(
+                    symbol = symbol,
+                    side = ?side,
+                    qty = %qty,
+                    price = %limit_price,
+                    nonce = nonce,
+                    "Pre-signed HL IOC order cached"
+                );
+            }
+            Err(e) => {
+                debug!(error = %e, "Failed to pre-sign HL IOC order");
+            }
+        }
+    }
+
     async fn submit_hl_ioc_with_opts(
         &self,
         symbol: &str,
@@ -745,11 +874,6 @@ impl ExecutionClient for LiveExecutor {
         reduce_only: bool,
         client_order_id: &str,
     ) -> Result<FillEvent, ExecutionError> {
-        let signing_key = self
-            .hl_signing_key
-            .as_ref()
-            .ok_or_else(|| ExecutionError::Other("Hyperliquid private key is missing or not configured".into()))?;
-
         let (asset_id, sz_decimals) = self.resolve_hl_asset_info(symbol).await?;
         let is_buy = side == OrderSide::Buy;
 
@@ -761,37 +885,54 @@ impl ExecutionClient for LiveExecutor {
             limit_price
         };
 
-        let px_str = format_hl_price(effective_limit_price, sz_decimals);
-        let qty_str = format_hl_qty(qty, sz_decimals);
-
-        let action = HlOrderAction {
-            action_type: "order",
-            orders: vec![HlOrderWire {
-                a: asset_id,
-                b: is_buy,
-                p: &px_str,
-                s: &qty_str,
-                r: reduce_only,
-                t: HlOrderTypeWire {
-                    limit: HlLimitOrderWire { tif: "Ioc" },
-                },
-                c: None,
-            }],
-            grouping: "na",
+        // Check if pre-signed cache matches
+        let cached_hit = {
+            let mut lock = self.cached_ioc.write();
+            if let Some(c) = lock.take() {
+                let same_target = c.symbol == symbol && c.side == side && c.qty == qty && c.reduce_only == reduce_only;
+                let price_ok = if is_buy {
+                    c.limit_price >= effective_limit_price
+                } else {
+                    c.limit_price <= effective_limit_price
+                };
+                let fresh = c.generated_at.elapsed() <= Duration::from_secs(4);
+                if same_target && price_ok && fresh {
+                    info!(
+                        symbol = symbol,
+                        side = ?side,
+                        qty = %qty,
+                        price = %c.limit_price,
+                        nonce = c.nonce,
+                        age_ms = c.generated_at.elapsed().as_millis(),
+                        "HL IOC Leg 2 dispatched via PRE-SIGNED CACHE (0ms crypto latency)"
+                    );
+                    Some((c.payload, c.limit_price))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
 
-        let nonce = self.next_nonce();
-        let conn_id = build_l1_action_hash(&action, nonce)
-            .map_err(|e| ExecutionError::Other(format!("Build action hash failed: {}", e)))?;
+        let (payload, final_limit_px) = match cached_hit {
+            Some((p, px)) => (p, px),
+            None => {
+                let (p, _) = self.build_signed_hl_ioc_payload(
+                    symbol,
+                    side,
+                    qty,
+                    effective_limit_price,
+                    reduce_only,
+                    asset_id,
+                    sz_decimals,
+                )?;
+                (p, effective_limit_price)
+            }
+        };
 
-        let signature = sign_phantom_agent(signing_key, &conn_id, self.config.hl_is_mainnet)
-            .map_err(|e| ExecutionError::Other(format!("EIP-712 signing failed: {}", e)))?;
-
-        let payload = serde_json::json!({
-            "action": action,
-            "nonce": nonce,
-            "signature": signature,
-        });
+        let px_str = format_hl_price(final_limit_px, sz_decimals);
+        let qty_str = format_hl_qty(qty, sz_decimals);
 
         debug!(
             asset_id = asset_id,
@@ -807,14 +948,14 @@ impl ExecutionClient for LiveExecutor {
         let ws_opt = self.hl_trade_ws.read().clone();
         if let Some(ws) = ws_opt {
             if ws.is_healthy() {
-                match ws.post_action(payload.clone(), 3000).await {
+                match ws.post_action(payload.clone(), 1200).await {
                     Ok(resp_json) => {
                         return parse_hl_order_response(
                             &resp_json,
                             symbol,
                             side,
                             qty,
-                            effective_limit_price,
+                            final_limit_px,
                             client_order_id,
                         );
                     }
@@ -1360,5 +1501,50 @@ mod tests {
             ),
             Err(ExecutionError::Rejected(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_hl_ioc_pre_signed_cache() {
+        let config = LiveExecutorConfig {
+            bn_api_key: "dummy".into(),
+            bn_api_secret: "dummy".into(),
+            bn_rest_url: "http://dummy".into(),
+            bn_ws_url: "ws://dummy".into(),
+            hl_private_key: "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            hl_wallet: "0x54ca605d37b1ef9ff7b131239a54e78fa2b24dc9".into(),
+            hl_rest_url: "http://dummy".into(),
+            hl_ws_url: "ws://dummy".into(),
+            hl_is_mainnet: true,
+            hl_dex: "xyz".into(),
+        };
+        let executor = LiveExecutor::new(config).unwrap();
+        *executor.hl_asset_info.write() = Some((110099, 2));
+
+        // 1. Prepare cache for Buy 0.1 at 107.50
+        executor
+            .prepare_hl_ioc_cache("xyz:SKHY", OrderSide::Buy, dec!(0.1), dec!(107.50), false)
+            .await;
+
+        let cache = executor.cached_ioc.read().clone().unwrap();
+        assert_eq!(cache.side, OrderSide::Buy);
+        assert_eq!(cache.qty, dec!(0.1));
+        assert_eq!(cache.limit_price, dec!(107.50));
+        assert!(!cache.reduce_only);
+        assert!(cache.payload.get("signature").is_some());
+
+        // 2. Calling prepare again with same price and qty should be a no-op (keep same nonce)
+        let old_nonce = cache.nonce;
+        executor
+            .prepare_hl_ioc_cache("xyz:SKHY", OrderSide::Buy, dec!(0.1), dec!(107.50), false)
+            .await;
+        assert_eq!(executor.cached_ioc.read().as_ref().unwrap().nonce, old_nonce);
+
+        // 3. Price change updates the cached order with fresh nonce
+        executor
+            .prepare_hl_ioc_cache("xyz:SKHY", OrderSide::Buy, dec!(0.1), dec!(107.55), false)
+            .await;
+        let new_cache = executor.cached_ioc.read().clone().unwrap();
+        assert_eq!(new_cache.limit_price, dec!(107.55));
+        assert!(new_cache.nonce > old_nonce);
     }
 }

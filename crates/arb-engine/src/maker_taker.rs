@@ -343,6 +343,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
 
         let desired = self.compute_desired_quote(&hl, &bn, mom_1s_bps);
         self.reconcile_bn_order(desired, wall_ms).await?;
+        self.update_pre_signed_hl_ioc(&hl).await;
         self.refresh_state();
         Ok(())
     }
@@ -556,6 +557,55 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         None
     }
 
+    async fn update_pre_signed_hl_ioc(&self, hl: &L1Quote) {
+        let Some(ref active) = self.active_bn_order else {
+            return;
+        };
+        if !matches!(active.phase, OrderPhase::Resting) {
+            return;
+        }
+
+        let is_buy_bn = active.side == OrderSide::Buy;
+        let hl_side = if is_buy_bn { OrderSide::Sell } else { OrderSide::Buy };
+        let is_hl_buy = hl_side == OrderSide::Buy;
+
+        let pos_hl = self.snapshot.pos_hl.net_qty;
+        let reduce_only = (is_hl_buy && pos_hl < Decimal::ZERO) || (!is_hl_buy && pos_hl > Decimal::ZERO);
+
+        let best_px = if is_hl_buy { hl.ask_price } else { hl.bid_price };
+        if best_px <= Decimal::ZERO {
+            return;
+        }
+
+        let limit_price = compute_hl_ioc_limit_price(
+            best_px,
+            self.config.hl_slippage_bps,
+            self.config.hl_tick_size,
+            is_hl_buy,
+        );
+
+        let step = self.config.hl_step_size;
+        let remaining = active.orig_qty.saturating_sub(active.cum_filled_qty);
+        let hedge_qty = quantize_qty(remaining, step);
+        let hedge_qty = if reduce_only {
+            quantize_qty(hedge_qty.min(pos_hl.abs()), step)
+        } else {
+            hedge_qty
+        };
+
+        if hedge_qty > Decimal::ZERO && limit_price > Decimal::ZERO {
+            self.executor
+                .prepare_hl_ioc_cache(
+                    &self.config.symbol_hl,
+                    hl_side,
+                    hedge_qty,
+                    limit_price,
+                    reduce_only,
+                )
+                .await;
+        }
+    }
+
     async fn reconcile_bn_order(
         &mut self,
         desired: Option<DesiredQuote>,
@@ -634,6 +684,9 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                     reduce_only: want.reduce_only,
                     phase: OrderPhase::Resting,
                 });
+                if let Some(ref hl) = self.hl_quote {
+                    self.update_pre_signed_hl_ioc(hl).await;
+                }
             }
             Err(ExecutionError::PostOnlyRejected(msg)) => {
                 debug!(msg = %msg, price = %want.price, "BN GTX rejected (would take); skipping without risk penalty");

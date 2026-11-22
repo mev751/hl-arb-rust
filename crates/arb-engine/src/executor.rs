@@ -72,6 +72,17 @@ pub trait ExecutionClient: Send + Sync {
         client_order_id: &str,
     ) -> Result<FillEvent, ExecutionError>;
 
+    /// Pre-warm/pre-sign a Hyperliquid IOC hedge payload in background cache before a fill occurs.
+    async fn prepare_hl_ioc_cache(
+        &self,
+        _symbol: &str,
+        _side: OrderSide,
+        _qty: Decimal,
+        _limit_price: Decimal,
+        _reduce_only: bool,
+    ) {
+    }
+
     async fn submit_bn_post_only(
         &self,
         symbol: &str,
