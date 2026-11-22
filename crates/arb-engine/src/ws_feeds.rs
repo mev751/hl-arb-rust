@@ -301,6 +301,21 @@ pub fn spawn_bn_book_ticker_feed(
     });
 }
 
+/// Build the Binance USD-M Futures private User Data Stream URL (`.../private/ws/<listenKey>`).
+pub fn build_bn_user_stream_url(bn_ws_url: &str, listen_key: &str) -> String {
+    let trimmed = bn_ws_url.trim_end_matches('/');
+    let base = if trimmed.ends_with("/private/ws") {
+        trimmed.to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix("/public/ws") {
+        format!("{}/private/ws", prefix)
+    } else if let Some(prefix) = trimmed.strip_suffix("/ws") {
+        format!("{}/private/ws", prefix)
+    } else {
+        format!("{}/private/ws", trimmed)
+    };
+    format!("{}/{}", base, listen_key)
+}
+
 /// Spawn Binance Futures User Data Stream WebSocket with listenKey lifecycle and automatic reconnect.
 pub fn spawn_bn_user_data_feed(
     live_exec: Arc<LiveExecutor>,
@@ -335,13 +350,13 @@ pub fn spawn_bn_user_data_feed(
                 }
             };
 
-            let stream_url = format!("{}/{}", bn_ws_url.trim_end_matches('/'), listen_key);
-            info!("Connecting Binance User Data Stream WS...");
+            let stream_url = build_bn_user_stream_url(&bn_ws_url, &listen_key);
+            info!(endpoint = "private/ws", "Connecting Binance User Data Stream WS...");
             let connected_at = Instant::now();
 
             match connect_async_tls_with_config(stream_url.as_str(), None, true, None).await {
                 Ok((ws_stream, _)) => {
-                    info!("Binance User Data Stream WS connected");
+                    info!(endpoint = "private/ws", "Binance User Data Stream WS connected");
                     if tx
                         .send(EngineEvent::FeedHealth {
                             feed: FeedKind::BnUser,
@@ -633,5 +648,29 @@ mod tests {
             }
             other => panic!("Unexpected: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_build_bn_user_stream_url() {
+        assert_eq!(
+            build_bn_user_stream_url("wss://fstream.binance.com/ws", "KEY123"),
+            "wss://fstream.binance.com/private/ws/KEY123"
+        );
+        assert_eq!(
+            build_bn_user_stream_url("wss://fstream.binance.com/ws/", "KEY123"),
+            "wss://fstream.binance.com/private/ws/KEY123"
+        );
+        assert_eq!(
+            build_bn_user_stream_url("wss://fstream.binance.com/public/ws", "KEY123"),
+            "wss://fstream.binance.com/private/ws/KEY123"
+        );
+        assert_eq!(
+            build_bn_user_stream_url("wss://fstream.binance.com/private/ws", "KEY123"),
+            "wss://fstream.binance.com/private/ws/KEY123"
+        );
+        assert_eq!(
+            build_bn_user_stream_url("wss://fstream.binance.com", "KEY123"),
+            "wss://fstream.binance.com/private/ws/KEY123"
+        );
     }
 }
