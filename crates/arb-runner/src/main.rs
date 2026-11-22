@@ -8,11 +8,32 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use arb_core::{L1Quote, RiskManager, WalManager};
+use arb_core::{EngineSnapshot, L1Quote, RiskManager, WalManager};
 use arb_engine::{
-    ArbitrageEngine, DryRunExecutor, ExecutionClient, LiveExecutor, LiveExecutorConfig,
-    StartupReconciler,
+    spawn_bn_book_ticker_feed, spawn_bn_user_data_feed, spawn_hl_l2book_feed, ArbitrageEngine,
+    DryRunExecutor, EngineEvent, ExecutionClient, FeedKind, HlWsTradeClient, LiveExecutor,
+    LiveExecutorConfig, MakerTakerEngine, StartupReconciler,
 };
+
+fn build_live_executor_config(config: &AppConfig) -> LiveExecutorConfig {
+    let hl_dex = if let Some((prefix, _)) = config.strategy.symbol_hl.split_once(':') {
+        prefix.to_string()
+    } else {
+        String::new()
+    };
+    LiveExecutorConfig {
+        bn_api_key: config.venues.binance.api_key.clone(),
+        bn_api_secret: config.venues.binance.api_secret.clone(),
+        bn_rest_url: config.venues.binance.rest_url.clone(),
+        bn_ws_url: config.venues.binance.ws_url.clone(),
+        hl_wallet: config.venues.hyperliquid.wallet_address.clone(),
+        hl_private_key: config.venues.hyperliquid.private_key.clone(),
+        hl_rest_url: config.venues.hyperliquid.rest_url.clone(),
+        hl_ws_url: config.venues.hyperliquid.ws_url.clone(),
+        hl_is_mainnet: config.venues.hyperliquid.is_mainnet,
+        hl_dex,
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
     info!(
         dry_run = config.engine.dry_run,
+        execution_mode = %config.strategy.execution_mode,
         symbol_hl = %config.strategy.symbol_hl,
         symbol_bn = %config.strategy.symbol_bn,
         "Initializing Arbitrage Engine"
@@ -64,29 +86,16 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
     let strategy_config = config.strategy.to_strategy_config();
 
     // Use DryRunExecutor or LiveExecutor based on config
-    let executor: Arc<dyn ExecutionClient> = if config.engine.dry_run {
-        Arc::new(DryRunExecutor::new())
-    } else {
-        let hl_dex = if let Some((prefix, _)) = config.strategy.symbol_hl.split_once(':') {
-            prefix.to_string()
+    let (executor, live_exec_opt): (Arc<dyn ExecutionClient>, Option<Arc<LiveExecutor>>) =
+        if config.engine.dry_run {
+            (Arc::new(DryRunExecutor::new()), None)
         } else {
-            String::new()
+            let live = Arc::new(LiveExecutor::new(build_live_executor_config(&config))?);
+            (live.clone(), Some(live))
         };
-        let live_config = LiveExecutorConfig {
-            bn_api_key: config.venues.binance.api_key.clone(),
-            bn_api_secret: config.venues.binance.api_secret.clone(),
-            bn_rest_url: config.venues.binance.rest_url.clone(),
-            hl_wallet: config.venues.hyperliquid.wallet_address.clone(),
-            hl_private_key: config.venues.hyperliquid.private_key.clone(),
-            hl_rest_url: config.venues.hyperliquid.rest_url.clone(),
-            hl_is_mainnet: config.venues.hyperliquid.is_mainnet,
-            hl_dex,
-        };
-        Arc::new(LiveExecutor::new(live_config)?)
-    };
 
-    // Reconcile on startup
-    let initial_state = StartupReconciler::reconcile_on_startup(
+    // Reconcile on startup against true live venue positions
+    let outcome = StartupReconciler::reconcile_detailed(
         executor.as_ref(),
         existing_snapshot.as_ref(),
         &config.strategy.symbol_hl,
@@ -94,7 +103,16 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
     )
     .await?;
 
-    info!(initial_state = ?initial_state, "Startup reconciliation completed");
+    info!(
+        initial_state = ?outcome.initial_state,
+        live_hl = %outcome.live_hl_pos,
+        live_bn = %outcome.live_bn_pos,
+        "Startup reconciliation completed"
+    );
+
+    if config.strategy.execution_mode == "bn_maker_hl_taker" {
+        return run_maker_taker_loop(config, wal, existing_snapshot, risk_manager, strategy_config, executor, live_exec_opt, outcome).await;
+    }
 
     let mut engine = ArbitrageEngine::new(
         strategy_config,
@@ -103,23 +121,17 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
         executor.clone(),
     );
 
-    if let Some(state) = existing_snapshot {
-        let mut snap = engine.snapshot().clone();
-        snap.state = initial_state;
-        snap.pos_hl = state.pos_hl;
-        snap.pos_bn = state.pos_bn;
-        snap.completed_trades = state.completed_trades;
-        snap.total_realized_pnl_usdt = state.total_realized_pnl_usdt;
-        snap.total_fees_usdt = state.total_fees_usdt;
-        engine.restore_snapshot(snap);
-    } else {
-        engine.set_state(initial_state);
-    }
+    let mut snap = existing_snapshot
+        .unwrap_or_else(|| EngineSnapshot::new(config.strategy.symbol_hl.clone(), config.strategy.symbol_bn.clone()));
+    snap.state = outcome.initial_state;
+    snap.pos_hl.net_qty = outcome.live_hl_pos;
+    snap.pos_bn.net_qty = outcome.live_bn_pos;
+    engine.restore_snapshot(snap);
 
     engine.reset_circuit_breaker();
     info!("Risk manager circuit breaker initialized and active.");
 
-    info!("Engine continuous event loop started. Polling quotes every 200ms...");
+    info!("Legacy Taker-Taker event loop started. Polling quotes every 200ms...");
 
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
     let mut tick_count: u64 = 0;
@@ -173,6 +185,192 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
 
     info!("Arbitrage Engine shut down safely.");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_maker_taker_loop(
+    config: AppConfig,
+    wal: WalManager,
+    existing_snapshot: Option<EngineSnapshot>,
+    risk_manager: RiskManager,
+    strategy_config: arb_strategy::StrategyConfig,
+    executor: Arc<dyn ExecutionClient>,
+    live_exec_opt: Option<Arc<LiveExecutor>>,
+    outcome: arb_engine::ReconcileOutcome,
+) -> anyhow::Result<()> {
+    let mut engine = MakerTakerEngine::new(
+        strategy_config,
+        risk_manager,
+        wal,
+        executor.clone(),
+    );
+
+    let mut snap = existing_snapshot
+        .unwrap_or_else(|| EngineSnapshot::new(config.strategy.symbol_hl.clone(), config.strategy.symbol_bn.clone()));
+    snap.state = outcome.initial_state;
+    snap.pos_hl.net_qty = outcome.live_hl_pos;
+    snap.pos_bn.net_qty = outcome.live_bn_pos;
+    engine.restore_snapshot(snap);
+    engine.reset_circuit_breaker();
+
+    if config.engine.dry_run {
+        engine.set_all_feeds_healthy(true);
+        info!("BN Maker -> HL Taker loop started in DRY-RUN mode (200ms quote polling)...");
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+        let mut tick_count: u64 = 0;
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Shutdown signal received (Ctrl+C). Cleaning up open orders...");
+                    engine.shutdown().await?;
+                    break;
+                }
+                _ = interval.tick() => {
+                    tick_count += 1;
+                    if let Ok((q_hl, q_bn)) = executor.fetch_quotes(&config.strategy.symbol_hl, &config.strategy.symbol_bn).await {
+                        let _ = engine.process_event(EngineEvent::Quote(q_hl)).await;
+                        let _ = engine.process_event(EngineEvent::Quote(q_bn)).await;
+                    }
+                    let _ = engine.on_maintenance_tick().await;
+                    if tick_count % 30 == 0 {
+                        log_maker_taker_heartbeat(&engine, tick_count);
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let live_exec = live_exec_opt.expect("LiveExecutor must exist when dry_run=false");
+
+    // Pre-warm HL asset ID and master wallet, and cancel stale resting orders on Binance
+    live_exec.resolve_hl_asset_info(&config.strategy.symbol_hl).await?;
+    live_exec.resolve_hl_master_wallet().await?;
+    if let Err(e) = executor.cancel_bn_all_open_orders(&config.strategy.symbol_bn).await {
+        tracing::warn!(error = %e, "Failed initial cleanup of open Binance orders");
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<EngineEvent>(1024);
+    let (hl_health_tx, mut hl_health_rx) = tokio::sync::mpsc::channel::<bool>(32);
+
+    // 1. Spawn persistent HL WebSocket trade client (`post` action + 20s ping/pong)
+    let hl_ws_trade = HlWsTradeClient::spawn(
+        config.venues.hyperliquid.ws_url.clone(),
+        Some(hl_health_tx),
+    );
+    live_exec.attach_hl_trade_ws(hl_ws_trade);
+
+    let event_tx_hl_health = event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(healthy) = hl_health_rx.recv().await {
+            if event_tx_hl_health
+                .send(EngineEvent::FeedHealth {
+                    feed: FeedKind::HlTrade,
+                    healthy,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // 2. Spawn BN bookTicker WS, BN User Data Stream WS, and HL l2Book WS
+    spawn_bn_book_ticker_feed(
+        config.venues.binance.ws_url.clone(),
+        config.strategy.symbol_bn.clone(),
+        event_tx.clone(),
+    );
+    spawn_bn_user_data_feed(
+        live_exec.clone(),
+        config.venues.binance.ws_url.clone(),
+        config.strategy.symbol_bn.clone(),
+        event_tx.clone(),
+    );
+    spawn_hl_l2book_feed(
+        config.venues.hyperliquid.ws_url.clone(),
+        config.strategy.symbol_hl.clone(),
+        event_tx,
+    );
+
+    info!("Event-driven BN Maker (GTX 0%) -> HL WS Post IOC Taker (0.86 bps) engine started.");
+
+    let mut hb_interval = tokio::time::interval(std::time::Duration::from_secs(6));
+    hb_interval.tick().await;
+    let mut hb_count: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown signal received (Ctrl+C). Canceling BN orders & saving WAL...");
+                engine.shutdown().await?;
+                break;
+            }
+            maybe_ev = event_rx.recv() => {
+                match maybe_ev {
+                    Some(ev) => {
+                        if let Err(e) = engine.process_event(ev).await {
+                            tracing::warn!(error = %e, "Engine error processing WS event");
+                        }
+                    }
+                    None => {
+                        tracing::error!("All event producers exited unexpectedly; shutting down");
+                        engine.shutdown().await?;
+                        break;
+                    }
+                }
+            }
+            _ = hb_interval.tick() => {
+                hb_count += 1;
+                if let Err(e) = engine.on_maintenance_tick().await {
+                    tracing::warn!(error = %e, "Maintenance tick error");
+                }
+                log_maker_taker_heartbeat(&engine, hb_count);
+            }
+        }
+    }
+
+    info!("Arbitrage Engine shut down safely.");
+    Ok(())
+}
+
+fn log_maker_taker_heartbeat(engine: &MakerTakerEngine<dyn ExecutionClient>, hb_tick: u64) {
+    let (hl_q, bn_q) = engine.latest_quotes();
+    let (hl_ask, bn_bid, spread_bps) = match (hl_q, bn_q) {
+        (Some(hl), Some(bn)) => {
+            let mid = (hl.ask_price + bn.bid_price) / rust_decimal_macros::dec!(2.0);
+            let sp = if mid > rust_decimal::Decimal::ZERO {
+                ((bn.bid_price - hl.ask_price) / mid) * rust_decimal_macros::dec!(10000.0)
+            } else {
+                rust_decimal::Decimal::ZERO
+            };
+            (hl.ask_price, bn.bid_price, sp)
+        }
+        _ => (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO),
+    };
+    let ema_str = engine
+        .ema_basis_bps()
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "n/a".to_string());
+    let active_str = engine
+        .active_bn_order()
+        .map(|o| format!("{:?}@{}", o.side, o.price))
+        .unwrap_or_else(|| "none".to_string());
+
+    info!(
+        tick = hb_tick,
+        state = ?engine.state(),
+        pos_hl = %engine.snapshot().pos_hl.net_qty,
+        pos_bn = %engine.snapshot().pos_bn.net_qty,
+        hl_ask = %hl_ask,
+        bn_bid = %bn_bid,
+        spread_bps = %format!("{:.2}", spread_bps),
+        ema_bps = %ema_str,
+        active_bn = %active_str,
+        "[HEARTBEAT] Engine running normally"
+    );
 }
 
 async fn check_connectivity(config: AppConfig) -> anyhow::Result<()> {
@@ -273,22 +471,7 @@ async fn manual_close(config: AppConfig, force_live: bool) -> anyhow::Result<()>
     let strategy_config = config.strategy.to_strategy_config();
 
     let executor: Arc<dyn ExecutionClient> = if is_live {
-        let hl_dex = if let Some((prefix, _)) = config.strategy.symbol_hl.split_once(':') {
-            prefix.to_string()
-        } else {
-            String::new()
-        };
-        let live_config = LiveExecutorConfig {
-            bn_api_key: config.venues.binance.api_key.clone(),
-            bn_api_secret: config.venues.binance.api_secret.clone(),
-            bn_rest_url: config.venues.binance.rest_url.clone(),
-            hl_wallet: config.venues.hyperliquid.wallet_address.clone(),
-            hl_private_key: config.venues.hyperliquid.private_key.clone(),
-            hl_rest_url: config.venues.hyperliquid.rest_url.clone(),
-            hl_is_mainnet: config.venues.hyperliquid.is_mainnet,
-            hl_dex,
-        };
-        Arc::new(LiveExecutor::new(live_config)?)
+        Arc::new(LiveExecutor::new(build_live_executor_config(&config))?)
     } else {
         let dry_executor = Arc::new(DryRunExecutor::new());
         let q_hl = L1Quote {
@@ -383,22 +566,7 @@ async fn test_trade(
     let strategy_config = config.strategy.to_strategy_config();
 
     let (executor, q_hl, _q_bn): (Arc<dyn ExecutionClient>, L1Quote, L1Quote) = if is_live {
-        let hl_dex = if let Some((prefix, _)) = config.strategy.symbol_hl.split_once(':') {
-            prefix.to_string()
-        } else {
-            String::new()
-        };
-        let live_config = LiveExecutorConfig {
-            bn_api_key: config.venues.binance.api_key.clone(),
-            bn_api_secret: config.venues.binance.api_secret.clone(),
-            bn_rest_url: config.venues.binance.rest_url.clone(),
-            hl_wallet: config.venues.hyperliquid.wallet_address.clone(),
-            hl_private_key: config.venues.hyperliquid.private_key.clone(),
-            hl_rest_url: config.venues.hyperliquid.rest_url.clone(),
-            hl_is_mainnet: config.venues.hyperliquid.is_mainnet,
-            hl_dex,
-        };
-        let live_exec = Arc::new(LiveExecutor::new(live_config)?);
+        let live_exec = Arc::new(LiveExecutor::new(build_live_executor_config(&config))?);
         println!("Fetching live L1 quotes from Hyperliquid & Binance...");
         let (quotes_hl, quotes_bn) = live_exec.fetch_live_quotes(&config.strategy.symbol_hl, &config.strategy.symbol_bn).await?;
         println!("Live Top-of-Book Quotes:");

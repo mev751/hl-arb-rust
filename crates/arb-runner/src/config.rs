@@ -34,6 +34,72 @@ pub struct StrategySettings {
     pub hl_step_size: Decimal,
     pub bn_step_size: Decimal,
     pub roundtrip_fees_bps: Decimal,
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+    #[serde(default = "default_true")]
+    pub adaptive_baseline: bool,
+    #[serde(default = "default_ema_tau_secs")]
+    pub ema_tau_secs: u64,
+    #[serde(default = "default_adaptive_entry_delta_bps")]
+    pub adaptive_entry_delta_bps: Decimal,
+    #[serde(default = "default_adaptive_exit_delta_bps")]
+    pub adaptive_exit_delta_bps: Decimal,
+    #[serde(default = "default_reprice_cooldown_ms")]
+    pub reprice_cooldown_ms: u64,
+    #[serde(default = "default_max_quote_dist_ticks")]
+    pub max_quote_dist_ticks: u32,
+    #[serde(default = "default_extreme_jump_bps")]
+    pub extreme_jump_bps: Decimal,
+    #[serde(default = "default_hl_retry_slippages_bps")]
+    pub hl_retry_slippages_bps: Vec<Decimal>,
+    #[serde(default = "default_stale_quote_ms")]
+    pub stale_quote_ms: u64,
+    #[serde(default)]
+    pub max_hold_secs: u64,
+}
+
+fn default_execution_mode() -> String {
+    "bn_maker_hl_taker".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ema_tau_secs() -> u64 {
+    7200
+}
+
+fn default_adaptive_entry_delta_bps() -> Decimal {
+    Decimal::new(50, 1)
+}
+
+fn default_adaptive_exit_delta_bps() -> Decimal {
+    Decimal::new(40, 1)
+}
+
+fn default_reprice_cooldown_ms() -> u64 {
+    150
+}
+
+fn default_max_quote_dist_ticks() -> u32 {
+    3
+}
+
+fn default_extreme_jump_bps() -> Decimal {
+    Decimal::new(120, 1)
+}
+
+fn default_hl_retry_slippages_bps() -> Vec<Decimal> {
+    vec![
+        Decimal::new(100, 1),
+        Decimal::new(250, 1),
+        Decimal::new(500, 1),
+    ]
+}
+
+fn default_stale_quote_ms() -> u64 {
+    2000
 }
 
 impl StrategySettings {
@@ -51,6 +117,17 @@ impl StrategySettings {
             hl_step_size: self.hl_step_size,
             bn_step_size: self.bn_step_size,
             roundtrip_fees_bps: self.roundtrip_fees_bps,
+            execution_mode: self.execution_mode.clone(),
+            adaptive_baseline: self.adaptive_baseline,
+            ema_tau_secs: self.ema_tau_secs,
+            adaptive_entry_delta_bps: self.adaptive_entry_delta_bps,
+            adaptive_exit_delta_bps: self.adaptive_exit_delta_bps,
+            reprice_cooldown_ms: self.reprice_cooldown_ms,
+            max_quote_dist_ticks: self.max_quote_dist_ticks,
+            extreme_jump_bps: self.extreme_jump_bps,
+            hl_retry_slippages_bps: self.hl_retry_slippages_bps.clone(),
+            stale_quote_ms: self.stale_quote_ms,
+            max_hold_secs: self.max_hold_secs,
         }
     }
 }

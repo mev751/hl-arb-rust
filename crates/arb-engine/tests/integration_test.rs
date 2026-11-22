@@ -34,6 +34,7 @@ async fn test_full_arbitrage_lifecycle() -> anyhow::Result<()> {
         hl_step_size: dec!(0.1),
         bn_step_size: dec!(0.1),
         roundtrip_fees_bps: dec!(12.0),
+        ..Default::default()
     };
 
     let executor = Arc::new(DryRunExecutor::new());

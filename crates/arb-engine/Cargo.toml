@@ -20,7 +20,9 @@ anyhow.workspace = true
 uuid.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
-tokio = { workspace = true, features = ["sync", "macros"] }
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["full"] }
 sha3.workspace = true
 k256.workspace = true
 hmac.workspace = true

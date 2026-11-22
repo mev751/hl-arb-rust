@@ -16,6 +16,7 @@ pub struct StrategyConfig {
     pub entry_spread_bps: Decimal,
     pub exit_spread_bps: Decimal,
     pub order_chunk_qty: Decimal,
+    #[serde(default)]
     pub order_chunk_notional_usd: Option<Decimal>,
     pub max_position_qty: Decimal,
     pub hl_slippage_bps: Decimal,
@@ -23,6 +24,102 @@ pub struct StrategyConfig {
     pub hl_step_size: Decimal,
     pub bn_step_size: Decimal,
     pub roundtrip_fees_bps: Decimal,
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
+    #[serde(default = "default_true")]
+    pub adaptive_baseline: bool,
+    #[serde(default = "default_ema_tau_secs")]
+    pub ema_tau_secs: u64,
+    #[serde(default = "default_adaptive_entry_delta_bps")]
+    pub adaptive_entry_delta_bps: Decimal,
+    #[serde(default = "default_adaptive_exit_delta_bps")]
+    pub adaptive_exit_delta_bps: Decimal,
+    #[serde(default = "default_reprice_cooldown_ms")]
+    pub reprice_cooldown_ms: u64,
+    #[serde(default = "default_max_quote_dist_ticks")]
+    pub max_quote_dist_ticks: u32,
+    #[serde(default = "default_extreme_jump_bps")]
+    pub extreme_jump_bps: Decimal,
+    #[serde(default = "default_hl_retry_slippages_bps")]
+    pub hl_retry_slippages_bps: Vec<Decimal>,
+    #[serde(default = "default_stale_quote_ms")]
+    pub stale_quote_ms: u64,
+    #[serde(default)]
+    pub max_hold_secs: u64,
+}
+
+fn default_execution_mode() -> String {
+    "bn_maker_hl_taker".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ema_tau_secs() -> u64 {
+    7200
+}
+
+fn default_adaptive_entry_delta_bps() -> Decimal {
+    Decimal::new(50, 1)
+}
+
+fn default_adaptive_exit_delta_bps() -> Decimal {
+    Decimal::new(40, 1)
+}
+
+fn default_reprice_cooldown_ms() -> u64 {
+    150
+}
+
+fn default_max_quote_dist_ticks() -> u32 {
+    3
+}
+
+fn default_extreme_jump_bps() -> Decimal {
+    Decimal::new(120, 1)
+}
+
+fn default_hl_retry_slippages_bps() -> Vec<Decimal> {
+    vec![
+        Decimal::new(100, 1),
+        Decimal::new(250, 1),
+        Decimal::new(500, 1),
+    ]
+}
+
+fn default_stale_quote_ms() -> u64 {
+    2000
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            symbol_hl: "xyz:SKHY".to_string(),
+            symbol_bn: "SKHYUSDT".to_string(),
+            entry_spread_bps: Decimal::new(250, 1),
+            exit_spread_bps: Decimal::new(160, 1),
+            order_chunk_qty: Decimal::new(1, 1),
+            order_chunk_notional_usd: None,
+            max_position_qty: Decimal::new(30, 1),
+            hl_slippage_bps: Decimal::new(100, 1),
+            hl_tick_size: Decimal::new(1, 2),
+            hl_step_size: Decimal::new(1, 1),
+            bn_step_size: Decimal::new(1, 2),
+            roundtrip_fees_bps: Decimal::new(172, 2),
+            execution_mode: default_execution_mode(),
+            adaptive_baseline: default_true(),
+            ema_tau_secs: default_ema_tau_secs(),
+            adaptive_entry_delta_bps: default_adaptive_entry_delta_bps(),
+            adaptive_exit_delta_bps: default_adaptive_exit_delta_bps(),
+            reprice_cooldown_ms: default_reprice_cooldown_ms(),
+            max_quote_dist_ticks: default_max_quote_dist_ticks(),
+            extreme_jump_bps: default_extreme_jump_bps(),
+            hl_retry_slippages_bps: default_hl_retry_slippages_bps(),
+            stale_quote_ms: default_stale_quote_ms(),
+            max_hold_secs: 0,
+        }
+    }
 }
 
 pub struct CrossVenueArbStrategy {
@@ -341,6 +438,7 @@ mod tests {
             hl_step_size: dec!(0.1),
             bn_step_size: dec!(0.1),
             roundtrip_fees_bps: dec!(12.0),
+            ..Default::default()
         };
 
         let mut strategy = CrossVenueArbStrategy::new(config);

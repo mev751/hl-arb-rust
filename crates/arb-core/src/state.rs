@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategyState {
     Idle,
+    QuotingEntry,
     HlSubmitting,
     Hedging,
     Open,
+    QuotingExit,
     Closing,
     Unwind,
     Halted,

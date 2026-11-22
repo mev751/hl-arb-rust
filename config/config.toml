@@ -6,8 +6,13 @@ log_level = "info"
 [strategy]
 symbol_hl = "xyz:SKHY"
 symbol_bn = "SKHYUSDT"
-entry_spread_bps = 36.0
-exit_spread_bps = 15.0
+execution_mode = "bn_maker_hl_taker"
+adaptive_baseline = true
+ema_tau_secs = 7200
+adaptive_entry_delta_bps = 5.0
+adaptive_exit_delta_bps = 4.0
+entry_spread_bps = 25.0
+exit_spread_bps = 16.0
 # 指定每边下单参数（二选一）：
 # 1) order_chunk_notional_usd: 每边下单金额 (USDT/USD)，策略根据市价自动换算为币数 (如 100 USDT)
 # order_chunk_notional_usd = 100.0
@@ -17,8 +22,12 @@ max_position_qty = 3.0
 hl_slippage_bps = 10.0
 hl_tick_size = 0.01
 hl_step_size = 0.1
-bn_step_size = 0.1
-roundtrip_fees_bps = 9.8
+bn_step_size = 0.01
+roundtrip_fees_bps = 1.72
+reprice_cooldown_ms = 150
+max_quote_dist_ticks = 3
+extreme_jump_bps = 12.0
+stale_quote_ms = 2000
 
 [risk]
 max_position_qty = 3.0
