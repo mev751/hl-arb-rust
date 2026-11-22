@@ -56,6 +56,16 @@ pub struct StrategySettings {
     pub stale_quote_ms: u64,
     #[serde(default)]
     pub max_hold_secs: u64,
+    #[serde(default = "default_true")]
+    pub enable_reverse_arb: bool,
+    #[serde(default = "default_reverse_entry_spread_bps")]
+    pub reverse_entry_spread_bps: Decimal,
+    #[serde(default = "default_reverse_exit_spread_bps")]
+    pub reverse_exit_spread_bps: Decimal,
+    #[serde(default = "default_adaptive_reverse_entry_delta_bps")]
+    pub adaptive_reverse_entry_delta_bps: Decimal,
+    #[serde(default = "default_adaptive_reverse_exit_delta_bps")]
+    pub adaptive_reverse_exit_delta_bps: Decimal,
 }
 
 fn default_execution_mode() -> String {
@@ -64,6 +74,22 @@ fn default_execution_mode() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_reverse_entry_spread_bps() -> Decimal {
+    Decimal::new(50, 1)
+}
+
+fn default_reverse_exit_spread_bps() -> Decimal {
+    Decimal::new(180, 1)
+}
+
+fn default_adaptive_reverse_entry_delta_bps() -> Decimal {
+    Decimal::new(140, 1)
+}
+
+fn default_adaptive_reverse_exit_delta_bps() -> Decimal {
+    Decimal::new(10, 1)
 }
 
 fn default_ema_tau_secs() -> u64 {
@@ -128,6 +154,11 @@ impl StrategySettings {
             hl_retry_slippages_bps: self.hl_retry_slippages_bps.clone(),
             stale_quote_ms: self.stale_quote_ms,
             max_hold_secs: self.max_hold_secs,
+            enable_reverse_arb: self.enable_reverse_arb,
+            reverse_entry_spread_bps: self.reverse_entry_spread_bps,
+            reverse_exit_spread_bps: self.reverse_exit_spread_bps,
+            adaptive_reverse_entry_delta_bps: self.adaptive_reverse_entry_delta_bps,
+            adaptive_reverse_exit_delta_bps: self.adaptive_reverse_exit_delta_bps,
         }
     }
 }

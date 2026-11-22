@@ -413,6 +413,7 @@ impl<E: ExecutionClient + ?Sized> ArbitrageEngine<E> {
                             trade_id: format!("trade_{}", session_id),
                             symbol_hl: self.symbol_hl.clone(),
                             symbol_bn: self.symbol_bn.clone(),
+                            direction: Some(arb_core::ArbDirection::ShortSpread),
                             entry_hl_price,
                             entry_bn_price,
                             entry_qty: close_qty,

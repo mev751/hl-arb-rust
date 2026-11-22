@@ -1,6 +1,6 @@
 use arb_core::{
-    clocks::unix_now_ns, L1Quote, OrderSide, RiskConfig, RiskManager, StrategyState, VenueId,
-    WalManager,
+    clocks::unix_now_ns, ArbDirection, L1Quote, OrderSide, RiskConfig, RiskManager, StrategyState,
+    VenueId, WalManager,
 };
 use arb_engine::{
     BnOrderUpdate, DryRunExecutor, EngineEvent, ExecutionClient, FeedKind, MakerTakerEngine,
@@ -57,6 +57,11 @@ fn base_config() -> StrategyConfig {
         hl_retry_slippages_bps: vec![dec!(10.0), dec!(25.0), dec!(50.0)],
         stale_quote_ms: 60_000,
         max_hold_secs: 0,
+        enable_reverse_arb: true,
+        reverse_entry_spread_bps: dec!(5.0),
+        reverse_exit_spread_bps: dec!(18.0),
+        adaptive_reverse_entry_delta_bps: dec!(14.0),
+        adaptive_reverse_exit_delta_bps: dec!(1.0),
     }
 }
 
@@ -84,8 +89,8 @@ async fn push_quotes(
     let q_bn = make_quote(VenueId::BinanceFutures, "SKHYUSDT", bn_bid, dec!(10), bn_ask, dec!(10), ts_ns);
     exec.update_quote(q_hl.clone());
     exec.update_quote(q_bn.clone());
-    engine.process_event(EngineEvent::Quote(q_hl)).await?;
     engine.process_event(EngineEvent::Quote(q_bn)).await?;
+    engine.process_event(EngineEvent::Quote(q_hl)).await?;
     Ok(())
 }
 
@@ -607,6 +612,294 @@ async fn test_partial_fill_rest_reconcile_and_delayed_ws_no_double_count() -> an
     assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(0.1));
     assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(-0.1));
     assert_eq!(exec.query_position(VenueId::Hyperliquid, "xyz:SKHY").await?, dec!(0.1));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_maker_taker_reverse_arb_roundtrip() -> anyhow::Result<()> {
+    let temp_dir = std::env::temp_dir().join(format!("arb_mt_rev_{}", uuid::Uuid::new_v4()));
+    let wal = WalManager::new(&temp_dir)?;
+    let exec = Arc::new(DryRunExecutor::new());
+    let mut config = base_config();
+    config.reverse_entry_spread_bps = dec!(5.0);
+    config.reverse_exit_spread_bps = dec!(18.0);
+    let mut engine = MakerTakerEngine::new(config, base_risk(), wal, exec.clone());
+    engine.set_all_feeds_healthy(true);
+
+    let mut now = unix_now_ns();
+
+    // 1. Spread collapses to <= 5 bps (HL 100.00/100.01, BN 100.04/100.06 -> spread ~5 bps)
+    push_quotes(&mut engine, &exec, dec!(100.00), dec!(100.01), dec!(100.04), dec!(100.06), now).await?;
+    assert_eq!(engine.state(), StrategyState::QuotingEntry);
+    let ord = engine.active_bn_order().expect("BN Maker Buy order placed").clone();
+    assert_eq!(ord.side, OrderSide::Buy);
+    assert_eq!(ord.price, dec!(100.05));
+    assert_eq!(ord.orig_qty, dec!(0.1));
+    assert!(!ord.reduce_only);
+    assert!(ord.is_entry);
+
+    // 2. BN Buy fills -> Engine automatically hedges with HL Taker Sell (reduce_only = false)
+    exec.apply_bn_order_fill_state("SKHYUSDT", &ord.client_order_id, OrderSide::Buy, dec!(0.1), true);
+    engine
+        .process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+            symbol: "SKHYUSDT".into(),
+            client_order_id: ord.client_order_id.clone(),
+            order_id: 101,
+            side: OrderSide::Buy,
+            exec_type: "TRADE".into(),
+            order_status: "FILLED".into(),
+            last_filled_qty: dec!(0.1),
+            cum_filled_qty: dec!(0.1),
+            last_filled_px: dec!(100.05),
+            avg_price: dec!(100.05),
+            commission: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            is_maker: true,
+            reduce_only: false,
+            trade_id: 201,
+            event_time_ms: 100,
+        }))
+        .await?;
+
+    // Verify positions: Long BN (+0.1), Short HL (-0.1)
+    assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(0.1));
+    assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(-0.1));
+    assert_eq!(engine.state(), StrategyState::Open);
+
+    // 3. Advance time and spread widens back to >= 18 bps (HL 100.00/100.01, BN 100.19/100.21 -> spread ~19 bps)
+    now += 2_000_000_000;
+    push_quotes(&mut engine, &exec, dec!(100.00), dec!(100.01), dec!(100.19), dec!(100.21), now).await?;
+    assert_eq!(engine.state(), StrategyState::QuotingExit);
+    let exit_ord = engine.active_bn_order().expect("BN Maker Sell order placed").clone();
+    assert_eq!(exit_ord.side, OrderSide::Sell);
+    assert_eq!(exit_ord.price, dec!(100.20));
+    assert_eq!(exit_ord.orig_qty, dec!(0.1));
+    assert!(exit_ord.reduce_only);
+    assert!(!exit_ord.is_entry);
+
+    // 4. BN Sell fills -> Engine automatically hedges with HL Taker Buy (reduce_only = true)
+    exec.apply_bn_order_fill_state("SKHYUSDT", &exit_ord.client_order_id, OrderSide::Sell, dec!(0.1), true);
+    engine
+        .process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+            symbol: "SKHYUSDT".into(),
+            client_order_id: exit_ord.client_order_id.clone(),
+            order_id: 102,
+            side: OrderSide::Sell,
+            exec_type: "TRADE".into(),
+            order_status: "FILLED".into(),
+            last_filled_qty: dec!(0.1),
+            cum_filled_qty: dec!(0.1),
+            last_filled_px: dec!(100.20),
+            avg_price: dec!(100.20),
+            commission: Decimal::ZERO,
+            commission_asset: "USDT".into(),
+            is_maker: true,
+            reduce_only: true,
+            trade_id: 202,
+            event_time_ms: 200,
+        }))
+        .await?;
+
+    // Verify flat and Idle
+    assert_eq!(engine.snapshot().pos_bn.net_qty, Decimal::ZERO);
+    assert_eq!(engine.snapshot().pos_hl.net_qty, Decimal::ZERO);
+    assert_eq!(engine.state(), StrategyState::Idle);
+
+    // Verify completed trade
+    assert_eq!(engine.snapshot().completed_trades.len(), 1);
+    let trade = &engine.snapshot().completed_trades[0];
+    assert_eq!(trade.direction, Some(ArbDirection::LongSpread));
+    assert_eq!(trade.entry_bn_price, dec!(100.05));
+    assert_eq!(trade.exit_bn_price, Some(dec!(100.20)));
+    assert_eq!(trade.entry_hl_price, dec!(100.00));
+    assert_eq!(trade.exit_hl_price, Some(dec!(100.01)));
+    assert!(trade.gross_pnl_usdt > Decimal::ZERO);
+    assert!(trade.net_pnl_usdt > Decimal::ZERO);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bidirectional_mode1_then_mode2() -> anyhow::Result<()> {
+    let temp_dir = std::env::temp_dir().join(format!("arb_bidi_{}", uuid::Uuid::new_v4()));
+    let wal = WalManager::new(&temp_dir)?;
+    let exec = Arc::new(DryRunExecutor::new());
+    let mut config = base_config();
+    config.entry_spread_bps = dec!(25.0);
+    config.exit_spread_bps = dec!(15.0);
+    config.reverse_entry_spread_bps = dec!(5.0);
+    config.reverse_exit_spread_bps = dec!(18.0);
+    let mut engine = MakerTakerEngine::new(config, base_risk(), wal, exec.clone());
+    engine.set_all_feeds_healthy(true);
+
+    let mut ts = unix_now_ns();
+
+    // --- Round 1: Mode 1 (Short BN, Long HL) ---
+    // Spread expands to 30 bps -> Entry Sell BN
+    push_quotes(&mut engine, &exec, dec!(100.00), dec!(100.01), dec!(100.30), dec!(100.32), ts).await?;
+    let ord1 = engine.active_bn_order().expect("Mode 1 entry order").clone();
+    assert_eq!(ord1.side, OrderSide::Sell);
+
+    exec.apply_bn_order_fill_state("SKHYUSDT", &ord1.client_order_id, OrderSide::Sell, dec!(0.1), true);
+    engine.process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+        symbol: "SKHYUSDT".into(),
+        client_order_id: ord1.client_order_id,
+        order_id: 1,
+        side: OrderSide::Sell,
+        exec_type: "TRADE".into(),
+        order_status: "FILLED".into(),
+        last_filled_qty: dec!(0.1),
+        cum_filled_qty: dec!(0.1),
+        last_filled_px: dec!(100.31),
+        avg_price: dec!(100.31),
+        commission: Decimal::ZERO,
+        commission_asset: "USDT".into(),
+        is_maker: true,
+        reduce_only: false,
+        trade_id: 1,
+        event_time_ms: 1,
+    })).await?;
+
+    // Advance 2s, spread drops to 15 bps -> Exit Buy BN
+    ts += 2_000_000_000;
+    push_quotes(&mut engine, &exec, dec!(100.00), dec!(100.01), dec!(100.14), dec!(100.16), ts).await?;
+    let exit1 = engine.active_bn_order().expect("Mode 1 exit order").clone();
+    assert_eq!(exit1.side, OrderSide::Buy);
+
+    exec.apply_bn_order_fill_state("SKHYUSDT", &exit1.client_order_id, OrderSide::Buy, dec!(0.1), true);
+    engine.process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+        symbol: "SKHYUSDT".into(),
+        client_order_id: exit1.client_order_id,
+        order_id: 2,
+        side: OrderSide::Buy,
+        exec_type: "TRADE".into(),
+        order_status: "FILLED".into(),
+        last_filled_qty: dec!(0.1),
+        cum_filled_qty: dec!(0.1),
+        last_filled_px: dec!(100.15),
+        avg_price: dec!(100.15),
+        commission: Decimal::ZERO,
+        commission_asset: "USDT".into(),
+        is_maker: true,
+        reduce_only: true,
+        trade_id: 2,
+        event_time_ms: 2,
+    })).await?;
+
+    assert_eq!(engine.snapshot().completed_trades.len(), 1);
+    assert_eq!(engine.snapshot().completed_trades[0].direction, Some(ArbDirection::ShortSpread));
+    assert_eq!(engine.state(), StrategyState::Idle);
+
+    // --- Round 2: Mode 2 (Long BN, Short HL) ---
+    // Advance 2s, spread drops to 4 bps -> Entry Buy BN
+    ts += 2_000_000_000;
+    push_quotes(&mut engine, &exec, dec!(100.00), dec!(100.01), dec!(100.03), dec!(100.05), ts).await?;
+    let ord2 = engine.active_bn_order().expect("Mode 2 entry order").clone();
+    assert_eq!(ord2.side, OrderSide::Buy);
+
+    exec.apply_bn_order_fill_state("SKHYUSDT", &ord2.client_order_id, OrderSide::Buy, dec!(0.1), true);
+    engine.process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+        symbol: "SKHYUSDT".into(),
+        client_order_id: ord2.client_order_id,
+        order_id: 3,
+        side: OrderSide::Buy,
+        exec_type: "TRADE".into(),
+        order_status: "FILLED".into(),
+        last_filled_qty: dec!(0.1),
+        cum_filled_qty: dec!(0.1),
+        last_filled_px: dec!(100.04),
+        avg_price: dec!(100.04),
+        commission: Decimal::ZERO,
+        commission_asset: "USDT".into(),
+        is_maker: true,
+        reduce_only: false,
+        trade_id: 3,
+        event_time_ms: 3,
+    })).await?;
+
+    // Advance 2s, spread widens to 19 bps -> Exit Sell BN
+    ts += 2_000_000_000;
+    push_quotes(&mut engine, &exec, dec!(100.00), dec!(100.01), dec!(100.19), dec!(100.21), ts).await?;
+    let exit2 = engine.active_bn_order().expect("Mode 2 exit order").clone();
+    assert_eq!(exit2.side, OrderSide::Sell);
+
+    exec.apply_bn_order_fill_state("SKHYUSDT", &exit2.client_order_id, OrderSide::Sell, dec!(0.1), true);
+    engine.process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+        symbol: "SKHYUSDT".into(),
+        client_order_id: exit2.client_order_id,
+        order_id: 4,
+        side: OrderSide::Sell,
+        exec_type: "TRADE".into(),
+        order_status: "FILLED".into(),
+        last_filled_qty: dec!(0.1),
+        cum_filled_qty: dec!(0.1),
+        last_filled_px: dec!(100.19),
+        avg_price: dec!(100.19),
+        commission: Decimal::ZERO,
+        commission_asset: "USDT".into(),
+        is_maker: true,
+        reduce_only: true,
+        trade_id: 4,
+        event_time_ms: 4,
+    })).await?;
+
+    assert_eq!(engine.snapshot().completed_trades.len(), 2);
+    assert_eq!(engine.snapshot().completed_trades[1].direction, Some(ArbDirection::LongSpread));
+    assert_eq!(engine.state(), StrategyState::Idle);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reverse_arb_max_hold_emergency() -> anyhow::Result<()> {
+    let temp_dir = std::env::temp_dir().join(format!("arb_rev_hold_{}", uuid::Uuid::new_v4()));
+    let wal = WalManager::new(&temp_dir)?;
+    let exec = Arc::new(DryRunExecutor::new());
+    let mut config = base_config();
+    config.max_hold_secs = 2;
+    let mut engine = MakerTakerEngine::new(config, base_risk(), wal, exec.clone());
+    engine.set_all_feeds_healthy(true);
+
+    let now = unix_now_ns();
+    push_quotes(&mut engine, &exec, dec!(100.00), dec!(100.01), dec!(100.04), dec!(100.06), now).await?;
+    let ord = engine.active_bn_order().expect("Entry order").clone();
+
+    engine.process_event(EngineEvent::BnOrderUpdate(BnOrderUpdate {
+        symbol: "SKHYUSDT".into(),
+        client_order_id: ord.client_order_id,
+        order_id: 200,
+        side: OrderSide::Buy,
+        exec_type: "TRADE".into(),
+        order_status: "FILLED".into(),
+        last_filled_qty: dec!(0.1),
+        cum_filled_qty: dec!(0.1),
+        last_filled_px: dec!(100.05),
+        avg_price: dec!(100.05),
+        commission: Decimal::ZERO,
+        commission_asset: "USDT".into(),
+        is_maker: true,
+        reduce_only: false,
+        trade_id: 300,
+        event_time_ms: 10,
+    })).await?;
+
+    assert_eq!(engine.snapshot().pos_bn.net_qty, dec!(0.1));
+    assert_eq!(engine.snapshot().pos_hl.net_qty, dec!(-0.1));
+
+    // Wait until max_hold_secs elapses
+    tokio::time::sleep(tokio::time::Duration::from_millis(2100)).await;
+
+    // Trigger maintenance tick
+    engine.on_maintenance_tick().await?;
+
+    assert_eq!(engine.snapshot().pos_bn.net_qty, Decimal::ZERO);
+    assert_eq!(engine.snapshot().pos_hl.net_qty, Decimal::ZERO);
+    assert_eq!(engine.state(), StrategyState::Idle);
+    assert_eq!(engine.snapshot().completed_trades.len(), 1);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
     Ok(())

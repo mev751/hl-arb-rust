@@ -3,8 +3,8 @@ use crate::ws_feeds::{BnOrderUpdate, EngineEvent, FeedKind};
 use arb_core::{
     clocks::{unix_now_ms, unix_now_ns},
     compute_hl_ioc_limit_price, compute_mid_basis_bps, quantize_price, quantize_qty,
-    EngineSnapshot, FillEvent, L1Quote, OrderSide, RiskManager, StrategyState, TradeRoundTrip,
-    VenueId, WalManager,
+    ArbDirection, EngineSnapshot, FillEvent, L1Quote, OrderSide, RiskManager, StrategyState,
+    TradeRoundTrip, VenueId, WalManager,
 };
 use arb_strategy::StrategyConfig;
 use parking_lot::Mutex;
@@ -64,6 +64,7 @@ impl FeedHealthState {
 #[derive(Debug, Default)]
 struct RoundAccumulator {
     active: bool,
+    direction: Option<ArbDirection>,
     entry_time_ns: u64,
     entry_basis_bps: Decimal,
     entry_hl_notional: Decimal,
@@ -176,6 +177,13 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         if !self.snapshot.pos_hl.net_qty.is_zero() || !self.snapshot.pos_bn.net_qty.is_zero() {
             self.first_open_wall_ms = Some(unix_now_ms());
             self.round.active = true;
+            self.round.direction = if self.snapshot.pos_bn.net_qty > Decimal::ZERO
+                || self.snapshot.pos_hl.net_qty < Decimal::ZERO
+            {
+                Some(ArbDirection::LongSpread)
+            } else {
+                Some(ArbDirection::ShortSpread)
+            };
             self.round.entry_time_ns = unix_now_ns();
             let hq = self.snapshot.pos_hl.net_qty.abs();
             let bq = self.snapshot.pos_bn.net_qty.abs();
@@ -397,19 +405,12 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         Decimal::ZERO
     }
 
-    fn effective_thresholds(&self) -> (Decimal, Decimal) {
-        if self.config.adaptive_baseline {
-            if let Some(ema_f) = self.ema_basis_bps {
-                if let Ok(ema_dec) = Decimal::try_from(ema_f) {
-                    let ema_rounded = ema_dec.round_dp(4);
-                    return (
-                        ema_rounded + self.config.adaptive_entry_delta_bps,
-                        ema_rounded - self.config.adaptive_exit_delta_bps,
-                    );
-                }
-            }
-        }
-        (self.config.entry_spread_bps, self.config.exit_spread_bps)
+    fn effective_mode1_thresholds(&self) -> (Decimal, Decimal) {
+        self.config.effective_mode1_thresholds(self.ema_basis_bps)
+    }
+
+    fn effective_mode2_thresholds(&self) -> (Decimal, Decimal) {
+        self.config.effective_mode2_thresholds(self.ema_basis_bps)
     }
 
     fn compute_chunk_qty(&self, ref_price: Decimal) -> Decimal {
@@ -430,17 +431,21 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
     ) -> Option<DesiredQuote> {
         let tick = self.config.hl_tick_size;
         let max_dist = Decimal::from(self.config.max_quote_dist_ticks) * tick;
-        let (eff_entry_bps, eff_exit_bps) = self.effective_thresholds();
         let bps_denom = dec!(10_000);
 
         let pos_bn = self.snapshot.pos_bn.net_qty;
         let pos_hl = self.snapshot.pos_hl.net_qty;
 
-        // Priority 1: Exit short BN position (Buy GTX, reduce_only = true) when near BN bid
+        // =========================================================================
+        // PRIORITY 1: EXIT EXISTING POSITIONS
+        // =========================================================================
+
+        // 1A: Exit Mode 1 (Short BN, Long HL): Buy BN Maker (reduce_only = true)
         if pos_bn < Decimal::ZERO
             && (pos_bn.abs() >= self.config.hl_step_size || !pos_hl.is_zero())
             && mom_1s_bps >= -self.config.extreme_jump_bps
         {
+            let (_, eff_exit_bps) = self.effective_mode1_thresholds();
             let target_buy = quantize_price(
                 hl.bid_price * (Decimal::ONE + eff_exit_bps / bps_denom),
                 tick,
@@ -462,28 +467,89 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             }
         }
 
-        // Priority 2: Entry short BN / scale-in (Sell GTX, reduce_only = false) when near BN ask
-        let entry_qty = self.compute_chunk_qty(hl.ask_price);
-        let eff_pos = pos_bn.abs().max(pos_hl.abs());
-        if entry_qty > Decimal::ZERO
-            && eff_pos + entry_qty <= self.config.max_position_qty
+        // 1B: Exit Mode 2 (Long BN, Short HL): Sell BN Maker (reduce_only = true)
+        if pos_bn > Decimal::ZERO
+            && (pos_bn.abs() >= self.config.hl_step_size || !pos_hl.is_zero())
             && mom_1s_bps <= self.config.extreme_jump_bps
-            && self.risk.can_open_entry(entry_qty, pos_hl, pos_bn).is_ok()
         {
+            let (_, eff_rev_exit_bps) = self.effective_mode2_thresholds();
             let target_sell = quantize_price(
-                hl.ask_price * (Decimal::ONE + eff_entry_bps / bps_denom),
+                hl.ask_price * (Decimal::ONE + eff_rev_exit_bps / bps_denom),
                 tick,
                 true,
             );
             let q_sell = target_sell.max(bn.bid_price + tick);
             if q_sell > Decimal::ZERO && q_sell <= bn.ask_price + max_dist {
-                return Some(DesiredQuote {
-                    side: OrderSide::Sell,
-                    price: q_sell,
-                    qty: entry_qty,
-                    is_entry: true,
-                    reduce_only: false,
-                });
+                let base_chunk = self.compute_chunk_qty(hl.ask_price).max(self.config.hl_step_size);
+                let exit_qty = quantize_qty(base_chunk.min(pos_bn.abs()), self.config.bn_step_size);
+                if exit_qty > Decimal::ZERO {
+                    return Some(DesiredQuote {
+                        side: OrderSide::Sell,
+                        price: q_sell,
+                        qty: exit_qty,
+                        is_entry: false,
+                        reduce_only: true,
+                    });
+                }
+            }
+        }
+
+        // =========================================================================
+        // PRIORITY 2: ENTER NEW POSITIONS / SCALE IN
+        // =========================================================================
+        let eff_pos = pos_bn.abs().max(pos_hl.abs());
+
+        // 2A: Mode 1 Entry: Short BN (Sell GTX, reduce_only = false)
+        if pos_bn <= Decimal::ZERO && pos_hl >= Decimal::ZERO {
+            let entry_qty = self.compute_chunk_qty(hl.ask_price);
+            if entry_qty > Decimal::ZERO
+                && eff_pos + entry_qty <= self.config.max_position_qty
+                && mom_1s_bps <= self.config.extreme_jump_bps
+                && self.risk.can_open_entry(entry_qty, pos_hl, pos_bn).is_ok()
+            {
+                let (eff_entry_bps, _) = self.effective_mode1_thresholds();
+                let target_sell = quantize_price(
+                    hl.ask_price * (Decimal::ONE + eff_entry_bps / bps_denom),
+                    tick,
+                    true,
+                );
+                let q_sell = target_sell.max(bn.bid_price + tick);
+                if q_sell > Decimal::ZERO && q_sell <= bn.ask_price + max_dist {
+                    return Some(DesiredQuote {
+                        side: OrderSide::Sell,
+                        price: q_sell,
+                        qty: entry_qty,
+                        is_entry: true,
+                        reduce_only: false,
+                    });
+                }
+            }
+        }
+
+        // 2B: Mode 2 Entry: Long BN (Buy GTX, reduce_only = false)
+        if self.config.enable_reverse_arb && pos_bn >= Decimal::ZERO && pos_hl <= Decimal::ZERO {
+            let entry_qty = self.compute_chunk_qty(hl.bid_price);
+            if entry_qty > Decimal::ZERO
+                && eff_pos + entry_qty <= self.config.max_position_qty
+                && mom_1s_bps >= -self.config.extreme_jump_bps
+                && self.risk.can_open_entry(entry_qty, pos_hl, pos_bn).is_ok()
+            {
+                let (eff_rev_entry_bps, _) = self.effective_mode2_thresholds();
+                let target_buy = quantize_price(
+                    hl.bid_price * (Decimal::ONE + eff_rev_entry_bps / bps_denom),
+                    tick,
+                    false,
+                );
+                let q_buy = target_buy.min(bn.ask_price - tick);
+                if q_buy > Decimal::ZERO && q_buy >= bn.bid_price - max_dist {
+                    return Some(DesiredQuote {
+                        side: OrderSide::Buy,
+                        price: q_buy,
+                        qty: entry_qty,
+                        is_entry: true,
+                        reduce_only: false,
+                    });
+                }
             }
         }
 
@@ -852,18 +918,28 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             wal.log_fill(&fill)?;
         }
 
-        if fill.side == OrderSide::Sell {
-            // Entry short BN leg
-            if !self.round.active {
-                self.round.active = true;
-                self.round.entry_time_ns = fill.timestamp_ns;
-                self.round.entry_basis_bps = self.latest_mid_basis_bps;
-                self.first_open_wall_ms = Some(unix_now_ms());
-            }
+        if !self.round.active {
+            self.round.active = true;
+            self.round.entry_time_ns = fill.timestamp_ns;
+            self.round.entry_basis_bps = self.latest_mid_basis_bps;
+            self.round.direction = if fill.side == OrderSide::Sell {
+                Some(ArbDirection::ShortSpread)
+            } else {
+                Some(ArbDirection::LongSpread)
+            };
+            self.first_open_wall_ms = Some(unix_now_ms());
+        }
+
+        let is_entry = match self.round.direction {
+            Some(ArbDirection::ShortSpread) => fill.side == OrderSide::Sell,
+            Some(ArbDirection::LongSpread) => fill.side == OrderSide::Buy,
+            None => fill.side == OrderSide::Sell,
+        };
+
+        if is_entry {
             self.round.entry_bn_notional += fill.qty * fill.price;
             self.round.entry_bn_qty += fill.qty;
         } else {
-            // Exit buy BN leg
             self.round.exit_bn_notional += fill.qty * fill.price;
             self.round.exit_bn_qty += fill.qty;
         }
@@ -892,15 +968,19 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
 
             let is_buy = delta < Decimal::ZERO;
             let side = if is_buy { OrderSide::Buy } else { OrderSide::Sell };
-            let reduce_only = !is_buy;
+            let reduce_only = if is_buy {
+                self.snapshot.pos_hl.net_qty < Decimal::ZERO
+            } else {
+                self.snapshot.pos_hl.net_qty > Decimal::ZERO
+            };
             let hedge_qty = quantize_qty(delta.abs(), step);
             if hedge_qty <= Decimal::ZERO {
                 break;
             }
 
-            // Cap sell reduce_only to current long HL qty so reduceOnly never rejects
-            let hedge_qty = if reduce_only && self.snapshot.pos_hl.net_qty > Decimal::ZERO {
-                quantize_qty(hedge_qty.min(self.snapshot.pos_hl.net_qty), step)
+            // Cap reduce_only qty to current HL position size so reduceOnly never rejects
+            let hedge_qty = if reduce_only {
+                quantize_qty(hedge_qty.min(self.snapshot.pos_hl.net_qty.abs()), step)
             } else {
                 hedge_qty
             };
@@ -1054,7 +1134,13 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             let mut wal = self.wal.lock();
             wal.log_fill(&fill)?;
         }
-        if is_buy {
+        let is_entry = match self.round.direction {
+            Some(ArbDirection::ShortSpread) => is_buy,
+            Some(ArbDirection::LongSpread) => !is_buy,
+            None => is_buy,
+        };
+
+        if is_entry {
             self.round.entry_hl_notional += fill.qty * fill.price;
             self.round.entry_hl_qty += fill.qty;
             self.risk.commit_fill(fill.qty);
@@ -1156,16 +1242,24 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
 
         let hl_qty = self.snapshot.pos_hl.net_qty;
         let bn_qty = self.snapshot.pos_bn.net_qty;
-        if hl_qty > Decimal::ZERO {
+        if !hl_qty.is_zero() {
+            let is_long = hl_qty > Decimal::ZERO;
+            let hl_side = if is_long { OrderSide::Sell } else { OrderSide::Buy };
             let lim = self
                 .hl_quote
                 .as_ref()
-                .map(|q| compute_hl_ioc_limit_price(q.bid_price, dec!(50.0), self.config.hl_tick_size, false))
+                .map(|q| {
+                    if is_long {
+                        compute_hl_ioc_limit_price(q.bid_price, dec!(50.0), self.config.hl_tick_size, false)
+                    } else {
+                        compute_hl_ioc_limit_price(q.ask_price, dec!(50.0), self.config.hl_tick_size, true)
+                    }
+                })
                 .unwrap_or(Decimal::ZERO);
             let cl_hl = format!("maxhold_hl_{}", unix_now_ns());
             if let Ok(f) = self
                 .executor
-                .submit_hl_ioc_with_opts(&self.config.symbol_hl, OrderSide::Sell, hl_qty, lim, true, &cl_hl)
+                .submit_hl_ioc_with_opts(&self.config.symbol_hl, hl_side, hl_qty.abs(), lim, true, &cl_hl)
                 .await
             {
                 let _ = self.wal.lock().log_fill(&f);
@@ -1185,10 +1279,8 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             {
                 self.record_order_accounted_qty(&cl_bn, f.qty);
                 let _ = self.wal.lock().log_fill(&f);
-                if side == OrderSide::Buy {
-                    self.round.exit_bn_notional += f.qty * f.price;
-                    self.round.exit_bn_qty += f.qty;
-                }
+                self.round.exit_bn_notional += f.qty * f.price;
+                self.round.exit_bn_qty += f.qty;
                 self.round.total_fees += f.fee;
                 self.snapshot.pos_bn.apply_fill(&f);
             }
@@ -1230,8 +1322,21 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         };
 
         // Exact cashflow PnL across both legs
-        let hl_pnl = self.round.exit_hl_notional - self.round.entry_hl_notional;
-        let bn_pnl = self.round.entry_bn_notional - self.round.exit_bn_notional;
+        let direction = self.round.direction.unwrap_or(ArbDirection::ShortSpread);
+        let (hl_pnl, bn_pnl) = match direction {
+            ArbDirection::ShortSpread => {
+                // Short BN (entry sell, exit buy), Long HL (entry buy, exit sell)
+                let hl_pnl = self.round.exit_hl_notional - self.round.entry_hl_notional;
+                let bn_pnl = self.round.entry_bn_notional - self.round.exit_bn_notional;
+                (hl_pnl, bn_pnl)
+            }
+            ArbDirection::LongSpread => {
+                // Long BN (entry buy, exit sell), Short HL (entry sell, exit buy)
+                let hl_pnl = self.round.entry_hl_notional - self.round.exit_hl_notional;
+                let bn_pnl = self.round.exit_bn_notional - self.round.entry_bn_notional;
+                (hl_pnl, bn_pnl)
+            }
+        };
         let gross_pnl = hl_pnl + bn_pnl;
         let fees = self.round.total_fees;
         let net_pnl = gross_pnl - fees;
@@ -1242,6 +1347,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             trade_id: format!("trade_mt_{}", unix_now_ns()),
             symbol_hl: self.config.symbol_hl.clone(),
             symbol_bn: self.config.symbol_bn.clone(),
+            direction: Some(direction),
             entry_hl_price: entry_hl_px,
             entry_bn_price: entry_bn_px,
             entry_qty: traded_qty,

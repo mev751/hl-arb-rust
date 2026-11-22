@@ -159,11 +159,21 @@ impl Position {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArbDirection {
+    /// Mode 1: Short BN Maker + Long HL Taker (Entry spread >= threshold, Exit spread <= threshold)
+    ShortSpread,
+    /// Mode 2: Long BN Maker + Short HL Taker (Entry spread <= threshold, Exit spread >= threshold)
+    LongSpread,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRoundTrip {
     pub trade_id: String,
     pub symbol_hl: String,
     pub symbol_bn: String,
+    #[serde(default)]
+    pub direction: Option<ArbDirection>,
     pub entry_hl_price: Decimal,
     pub entry_bn_price: Decimal,
     pub entry_qty: Decimal,

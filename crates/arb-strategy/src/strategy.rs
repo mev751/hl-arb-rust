@@ -46,6 +46,16 @@ pub struct StrategyConfig {
     pub stale_quote_ms: u64,
     #[serde(default)]
     pub max_hold_secs: u64,
+    #[serde(default = "default_true")]
+    pub enable_reverse_arb: bool,
+    #[serde(default = "default_reverse_entry_spread_bps")]
+    pub reverse_entry_spread_bps: Decimal,
+    #[serde(default = "default_reverse_exit_spread_bps")]
+    pub reverse_exit_spread_bps: Decimal,
+    #[serde(default = "default_adaptive_reverse_entry_delta_bps")]
+    pub adaptive_reverse_entry_delta_bps: Decimal,
+    #[serde(default = "default_adaptive_reverse_exit_delta_bps")]
+    pub adaptive_reverse_exit_delta_bps: Decimal,
 }
 
 fn default_execution_mode() -> String {
@@ -54,6 +64,22 @@ fn default_execution_mode() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_reverse_entry_spread_bps() -> Decimal {
+    Decimal::new(50, 1)
+}
+
+fn default_reverse_exit_spread_bps() -> Decimal {
+    Decimal::new(180, 1)
+}
+
+fn default_adaptive_reverse_entry_delta_bps() -> Decimal {
+    Decimal::new(140, 1)
+}
+
+fn default_adaptive_reverse_exit_delta_bps() -> Decimal {
+    Decimal::new(10, 1)
 }
 
 fn default_ema_tau_secs() -> u64 {
@@ -118,7 +144,44 @@ impl Default for StrategyConfig {
             hl_retry_slippages_bps: default_hl_retry_slippages_bps(),
             stale_quote_ms: default_stale_quote_ms(),
             max_hold_secs: 0,
+            enable_reverse_arb: default_true(),
+            reverse_entry_spread_bps: default_reverse_entry_spread_bps(),
+            reverse_exit_spread_bps: default_reverse_exit_spread_bps(),
+            adaptive_reverse_entry_delta_bps: default_adaptive_reverse_entry_delta_bps(),
+            adaptive_reverse_exit_delta_bps: default_adaptive_reverse_exit_delta_bps(),
         }
+    }
+}
+
+impl StrategyConfig {
+    pub fn effective_mode1_thresholds(&self, ema_basis_bps: Option<f64>) -> (Decimal, Decimal) {
+        if self.adaptive_baseline {
+            if let Some(ema_f) = ema_basis_bps {
+                if let Ok(ema_dec) = Decimal::try_from(ema_f) {
+                    let ema_rounded = ema_dec.round_dp(4);
+                    return (
+                        ema_rounded + self.adaptive_entry_delta_bps,
+                        ema_rounded - self.adaptive_exit_delta_bps,
+                    );
+                }
+            }
+        }
+        (self.entry_spread_bps, self.exit_spread_bps)
+    }
+
+    pub fn effective_mode2_thresholds(&self, ema_basis_bps: Option<f64>) -> (Decimal, Decimal) {
+        if self.adaptive_baseline {
+            if let Some(ema_f) = ema_basis_bps {
+                if let Ok(ema_dec) = Decimal::try_from(ema_f) {
+                    let ema_rounded = ema_dec.round_dp(4);
+                    return (
+                        ema_rounded - self.adaptive_reverse_entry_delta_bps,
+                        ema_rounded - self.adaptive_reverse_exit_delta_bps,
+                    );
+                }
+            }
+        }
+        (self.reverse_entry_spread_bps, self.reverse_exit_spread_bps)
     }
 }
 

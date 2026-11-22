@@ -13,6 +13,12 @@ adaptive_entry_delta_bps = 5.0
 adaptive_exit_delta_bps = 4.0
 entry_spread_bps = 30.0
 exit_spread_bps = 20.0
+# 反向套利（Mode 2：基差收窄/倒挂做多基差，Long BN Maker + Short HL Taker）
+enable_reverse_arb = true
+reverse_entry_spread_bps = 5.0
+reverse_exit_spread_bps = 18.0
+adaptive_reverse_entry_delta_bps = 14.0
+adaptive_reverse_exit_delta_bps = 1.0
 # 指定每边下单参数（二选一）：
 # 1) order_chunk_notional_usd: 每边下单金额 (USDT/USD)，策略根据市价自动换算为币数 (如 100 USDT)
 # order_chunk_notional_usd = 100.0
