@@ -188,6 +188,7 @@ impl HlWsTradeClient {
 
                     let mut awaiting_pong = false;
                     let mut last_ping = Instant::now();
+                    let mut pong_count: u64 = 0;
 
                     loop {
                         tokio::select! {
@@ -208,7 +209,15 @@ impl HlWsTradeClient {
                                         match parse_ws_post_message(&txt) {
                                             Ok(HlWsInbound::Pong) => {
                                                 awaiting_pong = false;
-                                                debug!("HL trade WS pong received");
+                                                pong_count = pong_count.wrapping_add(1);
+                                                if pong_count % 3 == 0 {
+                                                    info!(
+                                                        pongs = pong_count,
+                                                        "Hyperliquid trade WS keepalive active: received {{\"channel\":\"pong\"}} (20s heartbeat OK)"
+                                                    );
+                                                } else {
+                                                    debug!(pongs = pong_count, "HL trade WS pong received");
+                                                }
                                             }
                                             Ok(HlWsInbound::PostAction { id, payload }) => {
                                                 if let Some(waiter) = self.pending.lock().remove(&id) {

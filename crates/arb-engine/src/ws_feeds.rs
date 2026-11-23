@@ -522,6 +522,7 @@ pub fn spawn_hl_l2book_feed(
                         let mut awaiting_pong = false;
                         let mut last_ping = Instant::now();
                         let mut last_ts_ns: u64 = 0;
+                        let mut pong_count: u64 = 0;
 
                         loop {
                             tokio::select! {
@@ -531,7 +532,15 @@ pub fn spawn_hl_l2book_feed(
                                             match parse_hl_l2book(&txt, &symbol_hl) {
                                                 Some(HlMarketMsg::Pong) => {
                                                     awaiting_pong = false;
-                                                    debug!("HL l2Book WS pong received");
+                                                    pong_count = pong_count.wrapping_add(1);
+                                                    if pong_count % 3 == 0 {
+                                                        info!(
+                                                            pongs = pong_count,
+                                                            "Hyperliquid market WS keepalive active: received {{\"channel\":\"pong\"}} (20s heartbeat OK)"
+                                                        );
+                                                    } else {
+                                                        debug!(pongs = pong_count, "HL l2Book WS pong received");
+                                                    }
                                                 }
                                                 Some(HlMarketMsg::Quote(q)) => {
                                                     if should_accept_hl_quote(&mut last_ts_ns, q.timestamp_ns)
