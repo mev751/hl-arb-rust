@@ -251,6 +251,13 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             self.cancel_active_bn_order("stale_quotes").await;
         }
         self.check_max_hold_emergency().await?;
+        if self.active_bn_order.is_none() {
+            let delta = self.snapshot.pos_hl.net_qty + self.snapshot.pos_bn.net_qty;
+            if delta.abs() >= self.config.hl_step_size {
+                warn!(delta = %delta, "Maintenance tick detected unhedged delta; hedging now");
+                let _ = self.hedge_delta_if_needed().await;
+            }
+        }
         self.refresh_state();
         Ok(())
     }
@@ -496,15 +503,21 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         }
 
         // =========================================================================
-        // PRIORITY 2: ENTER NEW POSITIONS / SCALE IN
+        // PRIORITY 2: ENTER NEW POSITIONS (STRICT: Flat positions only)
         // =========================================================================
-        let eff_pos = pos_bn.abs().max(pos_hl.abs());
+        // If we currently hold an open position in either venue or unhedged delta,
+        // we MUST NOT open new positions! We strictly exit until completely flat
+        // to prevent churning and ensure clean atomic round trips.
+        let is_flat = pos_bn.is_zero() && pos_hl.is_zero();
+        if !is_flat {
+            return None;
+        }
 
         // 2A: Mode 1 Entry: Short BN (Sell GTX, reduce_only = false)
-        if pos_bn <= Decimal::ZERO && pos_hl >= Decimal::ZERO {
+        {
             let entry_qty = self.compute_chunk_qty(hl.ask_price);
             if entry_qty > Decimal::ZERO
-                && eff_pos + entry_qty <= self.config.max_position_qty
+                && entry_qty <= self.config.max_position_qty
                 && mom_1s_bps <= self.config.extreme_jump_bps
                 && self.risk.can_open_entry(entry_qty, pos_hl, pos_bn).is_ok()
             {
@@ -528,10 +541,10 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         }
 
         // 2B: Mode 2 Entry: Long BN (Buy GTX, reduce_only = false)
-        if self.config.enable_reverse_arb && pos_bn >= Decimal::ZERO && pos_hl <= Decimal::ZERO {
+        if self.config.enable_reverse_arb {
             let entry_qty = self.compute_chunk_qty(hl.bid_price);
             if entry_qty > Decimal::ZERO
-                && eff_pos + entry_qty <= self.config.max_position_qty
+                && entry_qty <= self.config.max_position_qty
                 && mom_1s_bps >= -self.config.extreme_jump_bps
                 && self.risk.can_open_entry(entry_qty, pos_hl, pos_bn).is_ok()
             {
