@@ -948,7 +948,7 @@ impl ExecutionClient for LiveExecutor {
         let ws_opt = self.hl_trade_ws.read().clone();
         if let Some(ws) = ws_opt {
             if ws.is_healthy() {
-                match ws.post_action(payload.clone(), 1200).await {
+                match ws.post_action(payload.clone(), 5000).await {
                     Ok(resp_json) => {
                         return parse_hl_order_response(
                             &resp_json,
@@ -965,8 +965,14 @@ impl ExecutionClient for LiveExecutor {
                             "HL WS post transport failed before delivery; falling back to REST /exchange"
                         );
                     }
+                    Err(ExecutionError::Timeout(err)) => {
+                        warn!(
+                            error = %err,
+                            "HL WS post timed out after 5000ms; falling back to REST /exchange"
+                        );
+                    }
                     Err(other) => {
-                        // Propagate Timeout / ZeroFill / Rejected without blind duplicate submission
+                        // Propagate ZeroFill / Rejected without blind duplicate submission
                         return Err(other);
                     }
                 }

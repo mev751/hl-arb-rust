@@ -1017,8 +1017,8 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
 
     async fn hedge_delta_if_needed(&mut self) -> Result<(), anyhow::Error> {
         let step = self.config.hl_step_size;
-        let slippages = if self.config.hl_retry_slippages_bps.is_empty() {
-            vec![dec!(10.0), dec!(25.0), dec!(50.0)]
+        let base_slippages = if self.config.hl_retry_slippages_bps.is_empty() {
+            vec![dec!(10.0), dec!(25.0), dec!(50.0), dec!(100.0), dec!(200.0)]
         } else {
             self.config.hl_retry_slippages_bps.clone()
         };
@@ -1054,25 +1054,34 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                 break;
             }
 
-            let best_px = match (&self.hl_quote, is_buy) {
+            let mut best_px = match (&self.hl_quote, is_buy) {
                 (Some(q), true) => q.ask_price,
                 (Some(q), false) => q.bid_price,
                 (None, _) => Decimal::ZERO,
             };
 
-            let mut hedged = false;
             let pre_hl_pos = self.snapshot.pos_hl.net_qty;
+            let mut attempt = 0;
 
-            for (attempt_idx, &slip_bps) in slippages.iter().enumerate() {
+            loop {
+                attempt += 1;
+
+                // Pick slippage according to attempt: widen gradually, max 200 bps
+                let slip_bps = if attempt <= base_slippages.len() {
+                    base_slippages[attempt - 1]
+                } else {
+                    dec!(200.0)
+                };
+
                 let limit_price = if best_px > Decimal::ZERO {
                     compute_hl_ioc_limit_price(best_px, slip_bps, self.config.hl_tick_size, is_buy)
                 } else {
                     Decimal::ZERO
                 };
-                let cl_id = format!("hl_h_{}_{}", attempt_idx + 1, unix_now_ns());
+                let cl_id = format!("hl_h_{}_{}", attempt, unix_now_ns());
 
                 info!(
-                    attempt = attempt_idx + 1,
+                    attempt = attempt,
                     side = ?side,
                     qty = %hedge_qty,
                     limit_price = %limit_price,
@@ -1095,20 +1104,28 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                 {
                     Ok(hl_fill) => {
                         self.apply_hl_fill(hl_fill, is_buy)?;
-                        hedged = true;
                         break;
                     }
                     Err(ExecutionError::ZeroFill) => {
                         warn!(
-                            attempt = attempt_idx + 1,
+                            attempt = attempt,
                             slip_bps = %slip_bps,
-                            "HL IOC ZeroFill; widening slippage on next retry"
+                            "HL IOC ZeroFill; refreshing quote and widening slippage on next retry"
                         );
+                        if let Ok((hl_q, _)) = self
+                            .executor
+                            .fetch_quotes(&self.config.symbol_hl, &self.config.symbol_bn)
+                            .await
+                        {
+                            self.hl_quote = Some(hl_q.clone());
+                            best_px = if is_buy { hl_q.ask_price } else { hl_q.bid_price };
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
                         continue;
                     }
                     Err(ExecutionError::Timeout(msg)) | Err(ExecutionError::Network(msg)) => {
                         warn!(
-                            attempt = attempt_idx + 1,
+                            attempt = attempt,
                             error = %msg,
                             "HL IOC transport uncertain; querying live HL position before retry"
                         );
@@ -1140,56 +1157,69 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                                 };
                                 info!(qty = %expected_sign, "Verified HL fill landed on-chain after timeout");
                                 self.apply_hl_fill(synth, is_buy)?;
-                                hedged = true;
                                 break;
                             }
                         }
+                        if let Ok((hl_q, _)) = self
+                            .executor
+                            .fetch_quotes(&self.config.symbol_hl, &self.config.symbol_bn)
+                            .await
+                        {
+                            self.hl_quote = Some(hl_q.clone());
+                            best_px = if is_buy { hl_q.ask_price } else { hl_q.bid_price };
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        continue;
                     }
                     Err(e) => {
-                        error!(attempt = attempt_idx + 1, error = %e, "HL IOC hedge error");
-                        break;
+                        error!(
+                            attempt = attempt,
+                            error = %e,
+                            "HL IOC hedge error; checking position and retrying"
+                        );
+                        if let Ok(live_hl) = self
+                            .executor
+                            .query_position(VenueId::Hyperliquid, &self.config.symbol_hl)
+                            .await
+                        {
+                            let filled_delta = live_hl - pre_hl_pos;
+                            let expected_sign = if is_buy { filled_delta } else { -filled_delta };
+                            if expected_sign >= step {
+                                let est_px = if best_px > Decimal::ZERO {
+                                    best_px
+                                } else {
+                                    self.snapshot.pos_hl.entry_price
+                                };
+                                let synth = FillEvent {
+                                    fill_id: format!("hl_verified_{}", unix_now_ns()),
+                                    client_order_id: cl_id,
+                                    venue: VenueId::Hyperliquid,
+                                    symbol: self.config.symbol_hl.clone(),
+                                    side,
+                                    price: est_px,
+                                    qty: expected_sign,
+                                    fee: est_px * expected_sign * Decimal::new(86, 6),
+                                    fee_asset: "USDC".to_string(),
+                                    is_maker: false,
+                                    timestamp_ns: unix_now_ns(),
+                                };
+                                info!(qty = %expected_sign, "Verified HL fill landed on-chain after error");
+                                self.apply_hl_fill(synth, is_buy)?;
+                                break;
+                            }
+                        }
+                        if let Ok((hl_q, _)) = self
+                            .executor
+                            .fetch_quotes(&self.config.symbol_hl, &self.config.symbol_bn)
+                            .await
+                        {
+                            self.hl_quote = Some(hl_q.clone());
+                            best_px = if is_buy { hl_q.ask_price } else { hl_q.bid_price };
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                        continue;
                     }
                 }
-            }
-
-            if !hedged {
-                error!(
-                    unhedged_qty = %hedge_qty,
-                    "CRITICAL: All HL hedge retries exhausted! Flattening unhedged BN leg and tripping circuit breaker."
-                );
-                let unwind_side = if is_buy { OrderSide::Buy } else { OrderSide::Sell };
-                let cl_unwind = format!("bn_unwind_{}", unix_now_ns());
-                match self
-                    .executor
-                    .submit_bn_market_with_opts(
-                        &self.config.symbol_bn,
-                        unwind_side,
-                        hedge_qty,
-                        is_buy, // reduce_only when buying back BN short
-                        &cl_unwind,
-                    )
-                    .await
-                {
-                    Ok(u_fill) => {
-                        self.record_order_accounted_qty(&cl_unwind, u_fill.qty);
-                        let _ = self.wal.lock().log_fill(&u_fill);
-                        self.round.total_fees += u_fill.fee;
-                        self.snapshot.pos_bn.apply_fill(&u_fill);
-                        let _ = self.maybe_finalize_round();
-                    }
-                    Err(ue) => {
-                        error!(error = %ue, "Emergency BN unwind failed!");
-                    }
-                }
-                self.risk.record_failure("HL Leg 2 hedge exhausted all slippage retries".into());
-                // Trip breaker cleanly
-                while !self.risk.is_halted() {
-                    self.risk.record_failure("HL Leg 2 hedge circuit trip".into());
-                }
-                self.snapshot.state = StrategyState::Halted;
-                let wal = self.wal.lock();
-                wal.save_state(&self.snapshot)?;
-                break;
             }
         }
         Ok(())
