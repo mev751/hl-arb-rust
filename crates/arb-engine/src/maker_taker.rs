@@ -1069,6 +1069,20 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                 (None, _) => Decimal::ZERO,
             };
 
+            // Hyperliquid rejects any non-reduce-only order with notional value < $10 USDC.
+            // If a partial Binance fill is below $10, do NOT spam HL or block the event loop;
+            // wait for remaining BN fills (or let dust cleanup flatten it once the BN order terminates).
+            if !reduce_only && best_px > Decimal::ZERO && (hedge_qty * best_px) < dec!(10.0) {
+                warn!(
+                    hedge_qty = %hedge_qty,
+                    best_px = %best_px,
+                    notional = %(hedge_qty * best_px),
+                    active_bn = self.active_bn_order.is_some(),
+                    "HL hedge notional below $10 minimum; deferring until more BN fill or dust cleanup"
+                );
+                break;
+            }
+
             let pre_hl_pos = self.snapshot.pos_hl.net_qty;
             let mut attempt = 0;
 
@@ -1181,6 +1195,16 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
                         continue;
                     }
                     Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("minimum value") || err_str.contains("Minimum value") {
+                            warn!(
+                                attempt = attempt,
+                                hedge_qty = %hedge_qty,
+                                error = %e,
+                                "HL rejected order due to $10 minimum value; exiting hedge loop to await further BN fill or dust cleanup"
+                            );
+                            return Ok(());
+                        }
                         error!(
                             attempt = attempt,
                             error = %e,
@@ -1269,7 +1293,16 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
         }
         let hl_qty = self.snapshot.pos_hl.net_qty;
         let bn_qty = self.snapshot.pos_bn.net_qty;
-        if hl_qty.is_zero() && !bn_qty.is_zero() && bn_qty.abs() < self.config.hl_step_size {
+        let ref_px = self
+            .hl_quote
+            .as_ref()
+            .map(|q| if bn_qty > Decimal::ZERO { q.bid_price } else { q.ask_price })
+            .unwrap_or(Decimal::ZERO);
+        let below_hl_min_notional = ref_px > Decimal::ZERO && (bn_qty.abs() * ref_px) < dec!(10.0);
+        if hl_qty.is_zero()
+            && !bn_qty.is_zero()
+            && (bn_qty.abs() < self.config.hl_step_size || below_hl_min_notional)
+        {
             let dust_qty = bn_qty.abs();
             let close_side = if bn_qty < Decimal::ZERO {
                 OrderSide::Buy
