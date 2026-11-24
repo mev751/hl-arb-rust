@@ -25,7 +25,9 @@ adaptive_reverse_exit_delta_bps = 1.0
 # 2) order_chunk_qty: 每边下单的固定币数 (若未设置 notional_usd 则使用此项)
 order_chunk_qty = 0.1
 max_position_qty = 1.0
-hl_slippage_bps = 10.0
+# HL Taker 吃单滑点保护（市价单强吃模式：直接给足 200 bps / 2% 滑点，保证第一下 100% 吃单成功，消除 ZeroFill 拒单）
+hl_slippage_bps = 200.0
+hl_retry_slippages_bps = [200.0, 300.0, 500.0]
 hl_tick_size = 0.01
 hl_step_size = 0.01
 bn_step_size = 0.01

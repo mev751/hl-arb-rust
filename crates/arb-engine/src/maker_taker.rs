@@ -590,9 +590,14 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             return;
         }
 
+        let initial_slip = if let Some(&first) = self.config.hl_retry_slippages_bps.first() {
+            first.max(self.config.hl_slippage_bps)
+        } else {
+            self.config.hl_slippage_bps.max(dec!(200.0))
+        };
         let limit_price = compute_hl_ioc_limit_price(
             best_px,
-            self.config.hl_slippage_bps,
+            initial_slip,
             self.config.hl_tick_size,
             is_hl_buy,
         );
@@ -1018,7 +1023,11 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
     async fn hedge_delta_if_needed(&mut self) -> Result<(), anyhow::Error> {
         let step = self.config.hl_step_size;
         let base_slippages = if self.config.hl_retry_slippages_bps.is_empty() {
-            vec![dec!(10.0), dec!(25.0), dec!(50.0), dec!(100.0), dec!(200.0)]
+            vec![
+                self.config.hl_slippage_bps.max(dec!(200.0)),
+                dec!(300.0),
+                dec!(500.0),
+            ]
         } else {
             self.config.hl_retry_slippages_bps.clone()
         };
