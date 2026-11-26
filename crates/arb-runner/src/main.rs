@@ -10,9 +10,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use arb_core::{EngineSnapshot, L1Quote, RiskManager, WalManager};
 use arb_engine::{
-    spawn_bn_book_ticker_feed, spawn_bn_user_data_feed, spawn_hl_l2book_feed, ArbitrageEngine,
-    DryRunExecutor, EngineEvent, ExecutionClient, FeedKind, HlWsTradeClient, LiveExecutor,
-    LiveExecutorConfig, MakerTakerEngine, StartupReconciler,
+    spawn_bn_book_ticker_feed, spawn_bn_user_data_feed, spawn_hl_l2book_feed,
+    spawn_hl_user_data_feed, ArbitrageEngine, DryRunExecutor, EngineEvent, ExecutionClient,
+    FeedKind, HlMakerBnTakerEngine, HlWsTradeClient, LiveExecutor, LiveExecutorConfig,
+    MakerTakerEngine, StartupReconciler,
 };
 
 fn build_live_executor_config(config: &AppConfig) -> LiveExecutorConfig {
@@ -113,6 +114,10 @@ async fn run_engine(config: AppConfig) -> anyhow::Result<()> {
 
     if config.strategy.execution_mode == "bn_maker_hl_taker" {
         return run_maker_taker_loop(config, wal, existing_snapshot, risk_manager, strategy_config, executor, live_exec_opt, outcome).await;
+    }
+
+    if config.strategy.execution_mode == "hl_maker_bn_taker" {
+        return run_hl_maker_bn_taker_loop(config, wal, existing_snapshot, risk_manager, strategy_config, executor, live_exec_opt, outcome).await;
     }
 
     let mut engine = ArbitrageEngine::new(
@@ -370,6 +375,192 @@ fn log_maker_taker_heartbeat(engine: &MakerTakerEngine<dyn ExecutionClient>, hb_
         spread_bps = %format!("{:.2}", spread_bps),
         ema_bps = %ema_str,
         active_bn = %active_str,
+        "[HEARTBEAT] Engine running normally"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_hl_maker_bn_taker_loop(
+    config: AppConfig,
+    wal: WalManager,
+    existing_snapshot: Option<EngineSnapshot>,
+    risk_manager: RiskManager,
+    strategy_config: arb_strategy::StrategyConfig,
+    executor: Arc<dyn ExecutionClient>,
+    live_exec_opt: Option<Arc<LiveExecutor>>,
+    outcome: arb_engine::ReconcileOutcome,
+) -> anyhow::Result<()> {
+    let mut engine = HlMakerBnTakerEngine::new(
+        strategy_config,
+        risk_manager,
+        wal,
+        executor.clone(),
+    );
+
+    let mut snap = existing_snapshot
+        .unwrap_or_else(|| EngineSnapshot::new(config.strategy.symbol_hl.clone(), config.strategy.symbol_bn.clone()));
+    snap.state = outcome.initial_state;
+    snap.pos_hl.net_qty = outcome.live_hl_pos;
+    snap.pos_bn.net_qty = outcome.live_bn_pos;
+    engine.restore_snapshot(snap);
+    engine.reset_circuit_breaker();
+
+    if config.engine.dry_run {
+        engine.set_all_feeds_healthy(true);
+        info!("HL Maker -> BN Taker loop started in DRY-RUN mode (200ms quote polling)...");
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+        let mut tick_count: u64 = 0;
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Shutdown signal received (Ctrl+C). Cleaning up open HL orders...");
+                    engine.shutdown().await?;
+                    break;
+                }
+                _ = interval.tick() => {
+                    tick_count += 1;
+                    if let Ok((q_hl, q_bn)) = executor.fetch_quotes(&config.strategy.symbol_hl, &config.strategy.symbol_bn).await {
+                        let _ = engine.process_event(EngineEvent::Quote(q_hl)).await;
+                        let _ = engine.process_event(EngineEvent::Quote(q_bn)).await;
+                    }
+                    let _ = engine.on_maintenance_tick().await;
+                    if tick_count % 30 == 0 {
+                        log_hl_maker_heartbeat(&engine, tick_count);
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let live_exec = live_exec_opt.expect("LiveExecutor must exist when dry_run=false");
+
+    // Pre-warm HL asset ID and master wallet, and cancel stale resting orders on Hyperliquid for this symbol
+    live_exec.resolve_hl_asset_info(&config.strategy.symbol_hl).await?;
+    let master_wallet = live_exec.resolve_hl_master_wallet().await?;
+    if let Err(e) = executor.cancel_hl_all_open_orders(&config.strategy.symbol_hl).await {
+        tracing::warn!(error = %e, "Failed initial cleanup of open Hyperliquid orders");
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<EngineEvent>(1024);
+    let (hl_health_tx, mut hl_health_rx) = tokio::sync::mpsc::channel::<bool>(32);
+
+    // 1. Spawn persistent HL WebSocket trade client (`post` action + 20s ping/pong)
+    let hl_ws_trade = HlWsTradeClient::spawn(
+        config.venues.hyperliquid.ws_url.clone(),
+        Some(hl_health_tx),
+    );
+    live_exec.attach_hl_trade_ws(hl_ws_trade);
+
+    let event_tx_hl_health = event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(healthy) = hl_health_rx.recv().await {
+            if event_tx_hl_health
+                .send(EngineEvent::FeedHealth {
+                    feed: FeedKind::HlTrade,
+                    healthy,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // 2. Spawn BN bookTicker WS, HL l2Book WS, and HL private user WS (userFills + orderUpdates)
+    spawn_bn_book_ticker_feed(
+        config.venues.binance.ws_url.clone(),
+        config.strategy.symbol_bn.clone(),
+        event_tx.clone(),
+    );
+    spawn_hl_l2book_feed(
+        config.venues.hyperliquid.ws_url.clone(),
+        config.strategy.symbol_hl.clone(),
+        event_tx.clone(),
+    );
+    spawn_hl_user_data_feed(
+        config.venues.hyperliquid.ws_url.clone(),
+        master_wallet,
+        config.strategy.symbol_hl.clone(),
+        event_tx,
+    );
+
+    info!("Event-driven HL Maker (ALO ~0.29 bps) -> BN Market Taker (4.0 bps) engine started.");
+
+    let mut hb_interval = tokio::time::interval(std::time::Duration::from_secs(6));
+    hb_interval.tick().await;
+    let mut hb_count: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown signal received (Ctrl+C). Canceling HL orders & saving WAL...");
+                engine.shutdown().await?;
+                break;
+            }
+            maybe_ev = event_rx.recv() => {
+                match maybe_ev {
+                    Some(ev) => {
+                        if let Err(e) = engine.process_event(ev).await {
+                            tracing::warn!(error = %e, "Engine error processing WS event");
+                        }
+                    }
+                    None => {
+                        tracing::error!("All event producers exited unexpectedly; shutting down");
+                        engine.shutdown().await?;
+                        break;
+                    }
+                }
+            }
+            _ = hb_interval.tick() => {
+                hb_count += 1;
+                if let Err(e) = engine.on_maintenance_tick().await {
+                    tracing::warn!(error = %e, "Maintenance tick error");
+                }
+                log_hl_maker_heartbeat(&engine, hb_count);
+            }
+        }
+    }
+
+    info!("Arbitrage Engine shut down safely.");
+    Ok(())
+}
+
+fn log_hl_maker_heartbeat(engine: &HlMakerBnTakerEngine<dyn ExecutionClient>, hb_tick: u64) {
+    let (hl_q, bn_q) = engine.latest_quotes();
+    let (hl_ask, bn_bid, spread_bps) = match (hl_q, bn_q) {
+        (Some(hl), Some(bn)) => {
+            let mid = (hl.ask_price + bn.bid_price) / rust_decimal_macros::dec!(2.0);
+            let sp = if mid > rust_decimal::Decimal::ZERO {
+                ((bn.bid_price - hl.ask_price) / mid) * rust_decimal_macros::dec!(10000.0)
+            } else {
+                rust_decimal::Decimal::ZERO
+            };
+            (hl.ask_price, bn.bid_price, sp)
+        }
+        _ => (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO),
+    };
+    let ema_str = engine
+        .ema_basis_bps()
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "n/a".to_string());
+    let active_str = engine
+        .active_hl_order()
+        .map(|o| format!("{:?}@{}", o.side, o.price))
+        .unwrap_or_else(|| "none".to_string());
+
+    info!(
+        tick = hb_tick,
+        state = ?engine.state(),
+        pos_hl = %engine.snapshot().pos_hl.net_qty,
+        pos_bn = %engine.snapshot().pos_bn.net_qty,
+        hl_ask = %hl_ask,
+        bn_bid = %bn_bid,
+        spread_bps = %format!("{:.2}", spread_bps),
+        ema_bps = %ema_str,
+        active_hl = %active_str,
         "[HEARTBEAT] Engine running normally"
     );
 }

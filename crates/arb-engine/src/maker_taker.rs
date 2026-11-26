@@ -217,6 +217,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             EngineEvent::BnOrderUpdate(upd) => {
                 self.on_bn_order_update(upd).await?;
             }
+            EngineEvent::HlUserFill(_) | EngineEvent::HlOrderUpdate(_) => {}
         }
         Ok(())
     }
@@ -228,6 +229,7 @@ impl<E: ExecutionClient + ?Sized> MakerTakerEngine<E> {
             FeedKind::BnUser => self.feeds.bn_user_ok = healthy,
             FeedKind::HlMarket => self.feeds.hl_market_ok = healthy,
             FeedKind::HlTrade => self.feeds.hl_trade_ok = healthy,
+            FeedKind::HlUser => return Ok(()),
         }
 
         if !healthy {

@@ -1,4 +1,4 @@
-use crate::executor::{BnOrderAck, ExecutionClient, ExecutionError};
+use crate::executor::{BnOrderAck, ExecutionClient, ExecutionError, HlOrderAck};
 use arb_core::{clocks::unix_now_ns, FillEvent, L1Quote, OrderSide, VenueId};
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -14,7 +14,10 @@ struct DryRunState {
     positions: HashMap<(VenueId, String), Decimal>,
     open_bn_orders: HashMap<String, BnOrderAck>,
     closed_bn_orders: HashMap<String, BnOrderAck>,
+    open_hl_orders: HashMap<u64, HlOrderAck>,
+    closed_hl_orders: HashMap<u64, HlOrderAck>,
     next_order_id: i64,
+    next_hl_oid: u64,
     hl_forced_zero_fills: usize,
 }
 
@@ -30,6 +33,7 @@ impl DryRunExecutor {
         Self {
             state: Arc::new(RwLock::new(DryRunState {
                 next_order_id: 1,
+                next_hl_oid: 1,
                 ..Default::default()
             })),
             bn_taker_fee_rate: dec!(0.0004),          // 4.00 bps Binance taker fee
@@ -87,6 +91,47 @@ impl DryRunExecutor {
             } else {
                 ord.status = "PARTIALLY_FILLED".to_string();
                 state.open_bn_orders.insert(client_order_id.to_string(), ord);
+            }
+        }
+    }
+
+    /// Snapshot of currently open simulated Hyperliquid ALO post-only orders.
+    pub fn open_hl_orders(&self) -> Vec<HlOrderAck> {
+        self.state.read().open_hl_orders.values().cloned().collect()
+    }
+
+    /// Record a simulated Hyperliquid Maker fill in dry-run position state.
+    pub fn record_hl_maker_fill(&self, symbol: &str, side: OrderSide, qty: Decimal) {
+        let mut state = self.state.write();
+        let pos = state
+            .positions
+            .entry((VenueId::Hyperliquid, symbol.to_string()))
+            .or_insert(Decimal::ZERO);
+        match side {
+            OrderSide::Buy => *pos += qty,
+            OrderSide::Sell => *pos -= qty,
+        }
+    }
+
+    /// Update simulated HL order status (partial/full fill) in dry-run state.
+    pub fn apply_hl_order_fill_state(
+        &self,
+        symbol: &str,
+        oid: u64,
+        side: OrderSide,
+        fill_qty: Decimal,
+        is_terminal: bool,
+    ) {
+        self.record_hl_maker_fill(symbol, side, fill_qty);
+        let mut state = self.state.write();
+        if let Some(mut ord) = state.open_hl_orders.get(&oid).cloned() {
+            ord.executed_qty += fill_qty;
+            if is_terminal || ord.executed_qty >= ord.orig_qty {
+                ord.status = "filled".to_string();
+                state.open_hl_orders.remove(&oid);
+                state.closed_hl_orders.insert(oid, ord);
+            } else {
+                state.open_hl_orders.insert(oid, ord);
             }
         }
     }
@@ -381,5 +426,83 @@ impl ExecutionClient for DryRunExecutor {
             .get(&(venue, symbol.to_string()))
             .cloned()
             .unwrap_or(Decimal::ZERO))
+    }
+
+    async fn submit_hl_post_only(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        price: Decimal,
+        _reduce_only: bool,
+    ) -> Result<HlOrderAck, ExecutionError> {
+        let mut state = self.state.write();
+        if let Some(q_hl) = state.quotes.get(&(VenueId::Hyperliquid, symbol.to_string())) {
+            match side {
+                OrderSide::Buy if price >= q_hl.ask_price => {
+                    return Err(ExecutionError::PostOnlyRejected(format!(
+                        "HL Buy price {} >= ask {}",
+                        price, q_hl.ask_price
+                    )));
+                }
+                OrderSide::Sell if price <= q_hl.bid_price => {
+                    return Err(ExecutionError::PostOnlyRejected(format!(
+                        "HL Sell price {} <= bid {}",
+                        price, q_hl.bid_price
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        state.next_hl_oid += 1;
+        let oid = state.next_hl_oid;
+        let ack = HlOrderAck {
+            oid,
+            status: "resting".to_string(),
+            price,
+            orig_qty: qty,
+            executed_qty: Decimal::ZERO,
+        };
+        state.open_hl_orders.insert(oid, ack.clone());
+        Ok(ack)
+    }
+
+    async fn cancel_hl_order(&self, _symbol: &str, oid: u64) -> Result<(), ExecutionError> {
+        let mut state = self.state.write();
+        if let Some(mut ord) = state.open_hl_orders.remove(&oid) {
+            ord.status = "canceled".to_string();
+            state.closed_hl_orders.insert(oid, ord);
+            Ok(())
+        } else {
+            Err(ExecutionError::OrderNotFound(format!(
+                "Simulated HL order {} not open",
+                oid
+            )))
+        }
+    }
+
+    async fn cancel_hl_all_open_orders(&self, _symbol: &str) -> Result<(), ExecutionError> {
+        let mut state = self.state.write();
+        let drained: Vec<(u64, HlOrderAck)> = state.open_hl_orders.drain().collect();
+        for (oid, mut ord) in drained {
+            ord.status = "canceled".to_string();
+            state.closed_hl_orders.insert(oid, ord);
+        }
+        Ok(())
+    }
+
+    async fn query_hl_order(&self, oid: u64) -> Result<HlOrderAck, ExecutionError> {
+        let state = self.state.read();
+        if let Some(ord) = state.open_hl_orders.get(&oid) {
+            return Ok(ord.clone());
+        }
+        if let Some(ord) = state.closed_hl_orders.get(&oid) {
+            return Ok(ord.clone());
+        }
+        Err(ExecutionError::OrderNotFound(format!(
+            "Simulated HL order {} not found",
+            oid
+        )))
     }
 }

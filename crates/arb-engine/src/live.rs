@@ -1,4 +1,4 @@
-use crate::executor::{BnOrderAck, ExecutionClient, ExecutionError};
+use crate::executor::{BnOrderAck, ExecutionClient, ExecutionError, HlOrderAck};
 use crate::hl_ws::HlWsTradeClient;
 use arb_core::{clocks::unix_now_ns, FillEvent, OrderSide, VenueId};
 use async_trait::async_trait;
@@ -489,6 +489,19 @@ pub struct HlLimitOrderWire<'a> {
 }
 
 #[derive(Serialize, Debug)]
+pub struct HlCancelAction {
+    #[serde(rename = "type")]
+    pub action_type: &'static str,
+    pub cancels: Vec<HlCancelWire>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct HlCancelWire {
+    pub a: u64,
+    pub o: u64,
+}
+
+#[derive(Serialize, Debug)]
 pub struct HlSignature {
     pub r: String,
     pub s: String,
@@ -653,11 +666,35 @@ impl LiveExecutor {
     }
     pub fn build_signed_hl_ioc_payload(
         &self,
-        _symbol: &str,
+        symbol: &str,
         side: OrderSide,
         qty: Decimal,
         effective_limit_price: Decimal,
         reduce_only: bool,
+        asset_id: u64,
+        sz_decimals: u32,
+    ) -> Result<(serde_json::Value, u64), ExecutionError> {
+        self.build_signed_hl_order_payload(
+            symbol,
+            side,
+            qty,
+            effective_limit_price,
+            reduce_only,
+            "Ioc",
+            asset_id,
+            sz_decimals,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_signed_hl_order_payload(
+        &self,
+        _symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        price: Decimal,
+        reduce_only: bool,
+        tif: &str,
         asset_id: u64,
         sz_decimals: u32,
     ) -> Result<(serde_json::Value, u64), ExecutionError> {
@@ -667,7 +704,7 @@ impl LiveExecutor {
             .ok_or_else(|| ExecutionError::Other("Hyperliquid private key is missing or not configured".into()))?;
 
         let is_buy = side == OrderSide::Buy;
-        let px_str = format_hl_price(effective_limit_price, sz_decimals);
+        let px_str = format_hl_price(price, sz_decimals);
         let qty_str = format_hl_qty(qty, sz_decimals);
 
         let action = HlOrderAction {
@@ -679,7 +716,7 @@ impl LiveExecutor {
                 s: &qty_str,
                 r: reduce_only,
                 t: HlOrderTypeWire {
-                    limit: HlLimitOrderWire { tif: "Ioc" },
+                    limit: HlLimitOrderWire { tif },
                 },
                 c: None,
             }],
@@ -701,6 +738,157 @@ impl LiveExecutor {
 
         Ok((payload, nonce))
     }
+
+    pub fn build_signed_hl_cancel_payload(
+        &self,
+        cancels: Vec<HlCancelWire>,
+    ) -> Result<(serde_json::Value, u64), ExecutionError> {
+        let signing_key = self
+            .hl_signing_key
+            .as_ref()
+            .ok_or_else(|| ExecutionError::Other("Hyperliquid private key is missing or not configured".into()))?;
+
+        let action = HlCancelAction {
+            action_type: "cancel",
+            cancels,
+        };
+
+        let nonce = self.next_nonce();
+        let conn_id = build_l1_action_hash(&action, nonce)
+            .map_err(|e| ExecutionError::Other(format!("Build cancel action hash failed: {}", e)))?;
+
+        let signature = sign_phantom_agent(signing_key, &conn_id, self.config.hl_is_mainnet)
+            .map_err(|e| ExecutionError::Other(format!("EIP-712 cancel signing failed: {}", e)))?;
+
+        let payload = serde_json::json!({
+            "action": action,
+            "nonce": nonce,
+            "signature": signature,
+        });
+
+        Ok((payload, nonce))
+    }
+
+    async fn send_hl_action(&self, payload: serde_json::Value) -> Result<serde_json::Value, ExecutionError> {
+        let ws_opt = self.hl_trade_ws.read().clone();
+        if let Some(ws) = ws_opt {
+            if ws.is_healthy() {
+                match ws.post_action(payload.clone(), 5000).await {
+                    Ok(resp_json) => return Ok(resp_json),
+                    Err(ExecutionError::Network(err)) => {
+                        warn!(
+                            error = %err,
+                            "HL WS post transport failed before delivery; falling back to REST /exchange"
+                        );
+                    }
+                    Err(ExecutionError::Timeout(err)) => {
+                        warn!(
+                            error = %err,
+                            "HL WS post timed out after 5000ms; falling back to REST /exchange"
+                        );
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/exchange", self.config.hl_rest_url))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| ExecutionError::Network(format!("HL /exchange network error: {}", e)))?;
+
+        let status_code = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ExecutionError::Network(format!("Read HL response body failed: {}", e)))?;
+
+        if !status_code.is_success() {
+            return Err(ExecutionError::Rejected(format!(
+                "HL /exchange HTTP {}: {}",
+                status_code, body
+            )));
+        }
+
+        serde_json::from_str(&body).map_err(|e| {
+            ExecutionError::Other(format!("Parse HL json response failed: {}, body: {}", e, body))
+        })
+    }
+}
+
+/// Parse a Hyperliquid `/exchange` or WS `post` ALO (Post-Only) order response into an `HlOrderAck`.
+pub fn parse_hl_post_only_response(
+    resp_json: &serde_json::Value,
+    qty: Decimal,
+    price: Decimal,
+) -> Result<HlOrderAck, ExecutionError> {
+    if resp_json.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return Err(ExecutionError::Rejected(format!(
+            "HL ALO order rejected: {}",
+            resp_json
+        )));
+    }
+
+    let statuses = resp_json
+        .get("response")
+        .and_then(|r| r.get("data"))
+        .and_then(|d| d.get("statuses"))
+        .and_then(|s| s.as_array());
+
+    if let Some(arr) = statuses {
+        if let Some(first) = arr.first() {
+            if let Some(err_msg) = first.get("error").and_then(|e| e.as_str()) {
+                let lower = err_msg.to_lowercase();
+                if lower.contains("post only") || lower.contains("immediately matched") {
+                    return Err(ExecutionError::PostOnlyRejected(err_msg.to_string()));
+                }
+                return Err(ExecutionError::Rejected(format!(
+                    "HL order error: {}",
+                    err_msg
+                )));
+            }
+
+            if let Some(resting) = first.get("resting") {
+                let oid = resting.get("oid").and_then(|o| o.as_u64()).unwrap_or(0);
+                return Ok(HlOrderAck {
+                    oid,
+                    status: "resting".to_string(),
+                    price,
+                    orig_qty: qty,
+                    executed_qty: Decimal::ZERO,
+                });
+            }
+
+            if let Some(filled) = first.get("filled") {
+                let oid = filled.get("oid").and_then(|o| o.as_u64()).unwrap_or(0);
+                let total_sz: Decimal = filled
+                    .get("totalSz")
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(qty);
+                let avg_px: Decimal = filled
+                    .get("avgPx")
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(price);
+                return Ok(HlOrderAck {
+                    oid,
+                    status: "filled".to_string(),
+                    price: avg_px,
+                    orig_qty: qty,
+                    executed_qty: total_sz,
+                });
+            }
+        }
+    }
+
+    Err(ExecutionError::Rejected(format!(
+        "Unexpected HL ALO response: {}",
+        resp_json
+    )))
 }
 
 /// Parse a Hyperliquid `/exchange` or WS `post` order response payload into a `FillEvent`.
@@ -1393,6 +1581,219 @@ impl ExecutionClient for LiveExecutor {
             }
         }
     }
+
+    async fn submit_hl_post_only(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        price: Decimal,
+        reduce_only: bool,
+    ) -> Result<HlOrderAck, ExecutionError> {
+        let (asset_id, sz_decimals) = self.resolve_hl_asset_info(symbol).await?;
+        let (payload, _) = self.build_signed_hl_order_payload(
+            symbol,
+            side,
+            qty,
+            price,
+            reduce_only,
+            "Alo",
+            asset_id,
+            sz_decimals,
+        )?;
+
+        let px_str = format_hl_price(price, sz_decimals);
+        let qty_str = format_hl_qty(qty, sz_decimals);
+        debug!(
+            symbol = symbol,
+            asset_id = asset_id,
+            side = ?side,
+            qty = %qty_str,
+            price = %px_str,
+            reduce_only = reduce_only,
+            "Submitting Hyperliquid ALO Post-Only order"
+        );
+
+        let resp_json = self.send_hl_action(payload).await?;
+        parse_hl_post_only_response(&resp_json, qty, price)
+    }
+
+    async fn cancel_hl_order(&self, symbol: &str, oid: u64) -> Result<(), ExecutionError> {
+        let (asset_id, _) = self.resolve_hl_asset_info(symbol).await?;
+        let (payload, _) = self.build_signed_hl_cancel_payload(vec![HlCancelWire {
+            a: asset_id,
+            o: oid,
+        }])?;
+
+        let resp_json = self.send_hl_action(payload).await?;
+        if resp_json.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Err(ExecutionError::Rejected(format!(
+                "HL cancel rejected: {}",
+                resp_json
+            )));
+        }
+
+        if let Some(first) = resp_json
+            .get("response")
+            .and_then(|r| r.get("data"))
+            .and_then(|d| d.get("statuses"))
+            .and_then(|s| s.as_array())
+            .and_then(|arr| arr.first())
+        {
+            if let Some(err_msg) = first.get("error").and_then(|e| e.as_str()) {
+                let lower = err_msg.to_lowercase();
+                if lower.contains("already canceled")
+                    || lower.contains("never placed")
+                    || lower.contains("already filled")
+                    || lower.contains("not found")
+                {
+                    return Err(ExecutionError::OrderNotFound(err_msg.to_string()));
+                }
+                return Err(ExecutionError::Rejected(err_msg.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    async fn cancel_hl_all_open_orders(&self, symbol: &str) -> Result<(), ExecutionError> {
+        let master_wallet = self.resolve_hl_master_wallet().await?;
+        let (asset_id, _) = self.resolve_hl_asset_info(symbol).await?;
+
+        let dex = if !self.config.hl_dex.is_empty() {
+            self.config.hl_dex.as_str()
+        } else {
+            symbol.split_once(':').map(|(p, _)| p).unwrap_or("")
+        };
+
+        let mut req_body = serde_json::json!({
+            "type": "openOrders",
+            "user": master_wallet,
+        });
+        if !dex.is_empty() {
+            req_body["dex"] = serde_json::Value::String(dex.to_string());
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/info", self.config.hl_rest_url))
+            .json(&req_body)
+            .send()
+            .await
+            .map_err(|e| ExecutionError::Network(format!("HL openOrders network error: {}", e)))?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ExecutionError::Network(format!("Read HL openOrders body failed: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(ExecutionError::Rejected(format!(
+                "HL openOrders HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let orders: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|e| {
+            ExecutionError::Other(format!("Parse HL openOrders json failed: {}, body: {}", e, body))
+        })?;
+
+        let cancels: Vec<HlCancelWire> = orders
+            .iter()
+            .filter(|item| item.get("coin").and_then(|c| c.as_str()) == Some(symbol))
+            .filter_map(|item| item.get("oid").and_then(|o| o.as_u64()))
+            .map(|oid| HlCancelWire { a: asset_id, o: oid })
+            .collect();
+
+        if cancels.is_empty() {
+            return Ok(());
+        }
+
+        info!(symbol = symbol, count = cancels.len(), "Canceling open Hyperliquid orders for symbol");
+        let (payload, _) = self.build_signed_hl_cancel_payload(cancels)?;
+        let resp_json = self.send_hl_action(payload).await?;
+        if resp_json.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Err(ExecutionError::Rejected(format!(
+                "HL batch cancel rejected: {}",
+                resp_json
+            )));
+        }
+        Ok(())
+    }
+
+    async fn query_hl_order(&self, oid: u64) -> Result<HlOrderAck, ExecutionError> {
+        let master_wallet = self.resolve_hl_master_wallet().await?;
+        let resp = self
+            .http
+            .post(format!("{}/info", self.config.hl_rest_url))
+            .json(&serde_json::json!({
+                "type": "orderStatus",
+                "user": master_wallet,
+                "oid": oid,
+            }))
+            .send()
+            .await
+            .map_err(|e| ExecutionError::Network(format!("HL orderStatus network error: {}", e)))?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ExecutionError::Network(format!("Read HL orderStatus body failed: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(ExecutionError::Rejected(format!(
+                "HL orderStatus HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let resp_json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            ExecutionError::Other(format!("Parse HL orderStatus json failed: {}, body: {}", e, body))
+        })?;
+
+        if resp_json.get("status").and_then(|v| v.as_str()) == Some("unknownOid") {
+            return Err(ExecutionError::OrderNotFound(format!(
+                "HL oid {} unknown",
+                oid
+            )));
+        }
+
+        let order_wrap = resp_json.get("order").ok_or_else(|| {
+            ExecutionError::Other(format!("Missing order field in orderStatus: {}", body))
+        })?;
+        let ord_status = order_wrap
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let inner = order_wrap.get("order").unwrap_or(order_wrap);
+
+        let price: Decimal = inner
+            .get("limitPx")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO);
+        let orig_qty: Decimal = inner
+            .get("origSz")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO);
+        let rem_qty: Decimal = inner
+            .get("sz")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO);
+        let executed_qty = (orig_qty - rem_qty).max(Decimal::ZERO);
+
+        Ok(HlOrderAck {
+            oid,
+            status: ord_status,
+            price,
+            orig_qty,
+            executed_qty,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1552,5 +1953,84 @@ mod tests {
         let new_cache = executor.cached_ioc.read().clone().unwrap();
         assert_eq!(new_cache.limit_price, dec!(107.55));
         assert!(new_cache.nonce > old_nonce);
+    }
+
+    #[test]
+    fn test_parse_hl_post_only_response_variants() {
+        let resting_json = serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{
+                        "resting": {
+                            "oid": 777123456u64
+                        }
+                    }]
+                }
+            }
+        });
+        let ack = parse_hl_post_only_response(&resting_json, dec!(0.3), dec!(33.75)).unwrap();
+        assert_eq!(ack.oid, 777123456);
+        assert_eq!(ack.status, "resting");
+        assert_eq!(ack.orig_qty, dec!(0.3));
+        assert_eq!(ack.executed_qty, Decimal::ZERO);
+
+        let alo_rejected = serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{
+                        "error": "Post only order would have immediately matched, bbo was 33.75@33.76."
+                    }]
+                }
+            }
+        });
+        assert!(matches!(
+            parse_hl_post_only_response(&alo_rejected, dec!(0.3), dec!(33.76)),
+            Err(ExecutionError::PostOnlyRejected(_))
+        ));
+
+        let min_val_rejected = serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{
+                        "error": "Order must have minimum value of $10. asset=110107"
+                    }]
+                }
+            }
+        });
+        assert!(matches!(
+            parse_hl_post_only_response(&min_val_rejected, dec!(0.3), dec!(33.00)),
+            Err(ExecutionError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_signed_hl_cancel_payload() {
+        let config = LiveExecutorConfig {
+            bn_api_key: "dummy".into(),
+            bn_api_secret: "dummy".into(),
+            bn_rest_url: "http://dummy".into(),
+            bn_ws_url: "ws://dummy".into(),
+            hl_private_key: "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            hl_wallet: "0x54ca605d37b1ef9ff7b131239a54e78fa2b24dc9".into(),
+            hl_rest_url: "http://dummy".into(),
+            hl_ws_url: "ws://dummy".into(),
+            hl_is_mainnet: true,
+            hl_dex: "xyz".into(),
+        };
+        let executor = LiveExecutor::new(config).unwrap();
+        let (payload, nonce) = executor
+            .build_signed_hl_cancel_payload(vec![HlCancelWire { a: 110107, o: 123456789 }])
+            .unwrap();
+        assert!(nonce > 0);
+        assert_eq!(payload["action"]["type"], "cancel");
+        assert_eq!(payload["action"]["cancels"][0]["a"], 110107);
+        assert_eq!(payload["action"]["cancels"][0]["o"], 123456789);
+        assert!(payload["signature"]["r"].as_str().unwrap().starts_with("0x"));
     }
 }

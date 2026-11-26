@@ -42,6 +42,16 @@ pub struct BnOrderAck {
     pub executed_qty: Decimal,
 }
 
+/// Acknowledgment or status snapshot of a Hyperliquid limit/ALO maker order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HlOrderAck {
+    pub oid: u64,
+    pub status: String,
+    pub price: Decimal,
+    pub orig_qty: Decimal,
+    pub executed_qty: Decimal,
+}
+
 #[async_trait]
 pub trait ExecutionClient: Send + Sync {
     async fn fetch_quotes(
@@ -133,6 +143,21 @@ pub trait ExecutionClient: Send + Sync {
         venue: VenueId,
         symbol: &str,
     ) -> Result<Decimal, ExecutionError>;
+
+    async fn submit_hl_post_only(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        price: Decimal,
+        reduce_only: bool,
+    ) -> Result<HlOrderAck, ExecutionError>;
+
+    async fn cancel_hl_order(&self, symbol: &str, oid: u64) -> Result<(), ExecutionError>;
+
+    async fn cancel_hl_all_open_orders(&self, symbol: &str) -> Result<(), ExecutionError>;
+
+    async fn query_hl_order(&self, oid: u64) -> Result<HlOrderAck, ExecutionError>;
 }
 
 #[async_trait]
@@ -238,5 +263,30 @@ impl<T: ExecutionClient + ?Sized> ExecutionClient for std::sync::Arc<T> {
         symbol: &str,
     ) -> Result<Decimal, ExecutionError> {
         (**self).query_position(venue, symbol).await
+    }
+
+    async fn submit_hl_post_only(
+        &self,
+        symbol: &str,
+        side: OrderSide,
+        qty: Decimal,
+        price: Decimal,
+        reduce_only: bool,
+    ) -> Result<HlOrderAck, ExecutionError> {
+        (**self)
+            .submit_hl_post_only(symbol, side, qty, price, reduce_only)
+            .await
+    }
+
+    async fn cancel_hl_order(&self, symbol: &str, oid: u64) -> Result<(), ExecutionError> {
+        (**self).cancel_hl_order(symbol, oid).await
+    }
+
+    async fn cancel_hl_all_open_orders(&self, symbol: &str) -> Result<(), ExecutionError> {
+        (**self).cancel_hl_all_open_orders(symbol).await
+    }
+
+    async fn query_hl_order(&self, oid: u64) -> Result<HlOrderAck, ExecutionError> {
+        (**self).query_hl_order(oid).await
     }
 }

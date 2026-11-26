@@ -19,6 +19,7 @@ pub enum FeedKind {
     BnUser,
     HlMarket,
     HlTrade,
+    HlUser,
 }
 
 /// Real-time Binance USD-M Futures `ORDER_TRADE_UPDATE` execution event.
@@ -42,11 +43,41 @@ pub struct BnOrderUpdate {
     pub event_time_ms: u64,
 }
 
-/// Unified event dispatched into `MakerTakerEngine` from WebSocket feeds.
+/// Real-time Hyperliquid `userFills` execution event.
+#[derive(Debug, Clone)]
+pub struct HlUserFill {
+    pub coin: String,
+    pub oid: u64,
+    pub tid: u64,
+    pub side: OrderSide,
+    pub price: Decimal,
+    pub qty: Decimal,
+    pub fee: Decimal,
+    pub fee_token: String,
+    pub is_maker: bool,
+    pub time_ms: u64,
+}
+
+/// Real-time Hyperliquid `orderUpdates` status event.
+#[derive(Debug, Clone)]
+pub struct HlOrderUpdate {
+    pub coin: String,
+    pub oid: u64,
+    pub side: OrderSide,
+    pub limit_px: Decimal,
+    pub orig_qty: Decimal,
+    pub remaining_qty: Decimal,
+    pub status: String,
+    pub status_time_ms: u64,
+}
+
+/// Unified event dispatched into arbitrage engines from WebSocket feeds.
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     Quote(L1Quote),
     BnOrderUpdate(BnOrderUpdate),
+    HlUserFill(HlUserFill),
+    HlOrderUpdate(HlOrderUpdate),
     FeedHealth { feed: FeedKind, healthy: bool },
 }
 
@@ -609,6 +640,268 @@ pub fn spawn_hl_l2book_feed(
     });
 }
 
+/// Parsed Hyperliquid private `userFills` / `orderUpdates` WebSocket frame outcome.
+#[derive(Debug, Clone)]
+pub enum HlUserStreamMsg {
+    Pong,
+    SnapshotIgnored,
+    Fills(Vec<HlUserFill>),
+    OrderUpdates(Vec<HlOrderUpdate>),
+    Other,
+}
+
+fn parse_hl_side(s: &str) -> Option<OrderSide> {
+    match s {
+        "B" => Some(OrderSide::Buy),
+        "A" => Some(OrderSide::Sell),
+        _ => None,
+    }
+}
+
+/// Parse a Hyperliquid `userFills` or `orderUpdates` WebSocket message for `expected_coin`.
+pub fn parse_hl_user_message(txt: &str, expected_coin: &str) -> Option<HlUserStreamMsg> {
+    let val: serde_json::Value = serde_json::from_str(txt).ok()?;
+    let channel = val.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+    let clean_expected = expected_coin.split(':').last().unwrap_or(expected_coin);
+    let matches_coin = |coin: &str| -> bool {
+        expected_coin.is_empty() || coin == expected_coin || coin == clean_expected
+    };
+
+    match channel {
+        "pong" => Some(HlUserStreamMsg::Pong),
+        "userFills" => {
+            let data = val.get("data")?;
+            if data.get("isSnapshot").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Some(HlUserStreamMsg::SnapshotIgnored);
+            }
+            let fills_arr = data.get("fills").and_then(|f| f.as_array())?;
+            let mut out = Vec::new();
+            for f in fills_arr {
+                let coin = f.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                if !matches_coin(coin) {
+                    continue;
+                }
+                let Some(side) = f.get("side").and_then(|v| v.as_str()).and_then(parse_hl_side) else {
+                    continue;
+                };
+                let oid = f.get("oid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let tid = f.get("tid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let price = parse_dec_field(f, "px");
+                let qty = parse_dec_field(f, "sz");
+                let fee = parse_dec_field(f, "fee");
+                let fee_token = f
+                    .get("feeToken")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("USDC")
+                    .to_string();
+                let crossed = f.get("crossed").and_then(|v| v.as_bool()).unwrap_or(false);
+                let time_ms = f.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
+                if qty > Decimal::ZERO && price > Decimal::ZERO {
+                    out.push(HlUserFill {
+                        coin: coin.to_string(),
+                        oid,
+                        tid,
+                        side,
+                        price,
+                        qty,
+                        fee,
+                        fee_token,
+                        is_maker: !crossed,
+                        time_ms,
+                    });
+                }
+            }
+            Some(HlUserStreamMsg::Fills(out))
+        }
+        "orderUpdates" => {
+            let arr = val.get("data").and_then(|d| d.as_array())?;
+            let mut out = Vec::new();
+            for entry in arr {
+                let Some(ord) = entry.get("order") else {
+                    continue;
+                };
+                let coin = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                if !matches_coin(coin) {
+                    continue;
+                }
+                let Some(side) = ord.get("side").and_then(|v| v.as_str()).and_then(parse_hl_side) else {
+                    continue;
+                };
+                let oid = ord.get("oid").and_then(|v| v.as_u64()).unwrap_or(0);
+                let limit_px = parse_dec_field(ord, "limitPx");
+                let orig_qty = parse_dec_field(ord, "origSz");
+                let remaining_qty = parse_dec_field(ord, "sz");
+                let status = entry
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let status_time_ms = entry
+                    .get("statusTimestamp")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                out.push(HlOrderUpdate {
+                    coin: coin.to_string(),
+                    oid,
+                    side,
+                    limit_px,
+                    orig_qty,
+                    remaining_qty,
+                    status,
+                    status_time_ms,
+                });
+            }
+            Some(HlUserStreamMsg::OrderUpdates(out))
+        }
+        _ => Some(HlUserStreamMsg::Other),
+    }
+}
+
+/// Spawn Hyperliquid private `userFills` + `orderUpdates` WebSocket feed with 20s JSON ping/pong keepalive.
+pub fn spawn_hl_user_data_feed(
+    hl_ws_url: String,
+    master_wallet: String,
+    symbol_hl: String,
+    tx: mpsc::Sender<EngineEvent>,
+) {
+    tokio::spawn(async move {
+        let backoffs_ms = [200u64, 500, 1000, 2000, 5000];
+        let mut attempt = 0usize;
+
+        loop {
+            info!(url = %hl_ws_url, user = %master_wallet, symbol = %symbol_hl, "Connecting Hyperliquid private user WS (userFills + orderUpdates)...");
+            let connected_at = Instant::now();
+
+            match connect_async_tls_with_config(hl_ws_url.as_str(), None, true, None).await {
+                Ok((ws_stream, _)) => {
+                    let (mut ws_sink, mut ws_rx) = ws_stream.split();
+                    let sub_fills = serde_json::json!({
+                        "method": "subscribe",
+                        "subscription": {
+                            "type": "userFills",
+                            "user": master_wallet,
+                        }
+                    });
+                    let sub_orders = serde_json::json!({
+                        "method": "subscribe",
+                        "subscription": {
+                            "type": "orderUpdates",
+                            "user": master_wallet,
+                        }
+                    });
+                    if let Err(e) = ws_sink.send(Message::Text(sub_fills.to_string())).await {
+                        warn!(error = %e, "Failed to send HL userFills subscription");
+                    } else if let Err(e) = ws_sink.send(Message::Text(sub_orders.to_string())).await {
+                        warn!(error = %e, "Failed to send HL orderUpdates subscription");
+                    } else {
+                        info!(symbol = %symbol_hl, "Hyperliquid private user WS connected & subscribed (userFills + orderUpdates)");
+                        if tx
+                            .send(EngineEvent::FeedHealth {
+                                feed: FeedKind::HlUser,
+                                healthy: true,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+
+                        let mut ping_interval = tokio::time::interval(HL_HEARTBEAT_INTERVAL);
+                        ping_interval.tick().await;
+                        let mut watchdog_interval = tokio::time::interval(HL_PONG_WATCHDOG_INTERVAL);
+                        watchdog_interval.tick().await;
+                        let mut awaiting_pong = false;
+                        let mut last_ping = Instant::now();
+                        let mut pong_count: u64 = 0;
+
+                        loop {
+                            tokio::select! {
+                                maybe_msg = ws_rx.next() => {
+                                    match maybe_msg {
+                                        Some(Ok(Message::Text(txt))) => {
+                                            match parse_hl_user_message(&txt, &symbol_hl) {
+                                                Some(HlUserStreamMsg::Pong) => {
+                                                    awaiting_pong = false;
+                                                    pong_count = pong_count.wrapping_add(1);
+                                                    debug!(pongs = pong_count, "HL user WS pong received");
+                                                }
+                                                Some(HlUserStreamMsg::SnapshotIgnored) => {
+                                                    info!(symbol = %symbol_hl, "Ignored initial Hyperliquid userFills historical snapshot");
+                                                }
+                                                Some(HlUserStreamMsg::Fills(fills)) => {
+                                                    for f in fills {
+                                                        if tx.send(EngineEvent::HlUserFill(f)).await.is_err() {
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                Some(HlUserStreamMsg::OrderUpdates(updates)) => {
+                                                    for u in updates {
+                                                        if tx.send(EngineEvent::HlOrderUpdate(u)).await.is_err() {
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        Some(Ok(Message::Ping(p))) => {
+                                            if ws_sink.send(Message::Pong(p)).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                        _ => {}
+                                    }
+                                }
+                                _ = ping_interval.tick() => {
+                                    if awaiting_pong && last_ping.elapsed() > HL_PONG_TIMEOUT {
+                                        warn!("HL user WS pong missing; reconnecting");
+                                        break;
+                                    }
+                                    if ws_sink.send(Message::Text(r#"{"method":"ping"}"#.to_string())).await.is_err() {
+                                        break;
+                                    }
+                                    awaiting_pong = true;
+                                    last_ping = Instant::now();
+                                }
+                                _ = watchdog_interval.tick() => {
+                                    if awaiting_pong && last_ping.elapsed() > HL_PONG_TIMEOUT {
+                                        warn!("HL user WS pong timeout (>6s); forcing reconnect");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if connected_at.elapsed() >= Duration::from_secs(10) {
+                            attempt = 0;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to connect Hyperliquid private user WS");
+                }
+            }
+
+            if tx
+                .send(EngineEvent::FeedHealth {
+                    feed: FeedKind::HlUser,
+                    healthy: false,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            let delay = backoffs_ms[attempt.min(backoffs_ms.len() - 1)];
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +1056,75 @@ mod tests {
             build_bn_user_stream_url("wss://fstream.binance.com", "KEY123"),
             "wss://fstream.binance.com/private/ws/KEY123"
         );
+    }
+
+    #[test]
+    fn test_parse_hl_user_message_snapshot_fills_and_orders() {
+        let snapshot_raw = r#"{
+            "channel": "userFills",
+            "data": {
+                "isSnapshot": true,
+                "user": "0x716ce5802be364b1fc17d45bd89ce8bc657ea787",
+                "fills": [
+                    {"coin": "xyz:SOXL", "px": "33.50", "sz": "0.3", "side": "B", "time": 1795621352796, "oid": 111, "crossed": false, "fee": "0.000289", "tid": 999, "feeToken": "USDC"}
+                ]
+            }
+        }"#;
+        assert!(matches!(
+            parse_hl_user_message(snapshot_raw, "xyz:SOXL").unwrap(),
+            HlUserStreamMsg::SnapshotIgnored
+        ));
+
+        let live_fills_raw = r#"{
+            "channel": "userFills",
+            "data": {
+                "isSnapshot": false,
+                "user": "0x716ce5802be364b1fc17d45bd89ce8bc657ea787",
+                "fills": [
+                    {"coin": "HYPE", "px": "47.7", "sz": "1.0", "side": "A", "time": 1795621352796, "oid": 100, "crossed": false, "fee": "0.001", "tid": 1, "feeToken": "USDC"},
+                    {"coin": "xyz:SOXL", "px": "33.75", "sz": "0.3", "side": "B", "time": 1795621352800, "oid": 200, "crossed": false, "fee": "0.0002916", "tid": 2, "feeToken": "USDC"}
+                ]
+            }
+        }"#;
+        match parse_hl_user_message(live_fills_raw, "xyz:SOXL").unwrap() {
+            HlUserStreamMsg::Fills(fills) => {
+                assert_eq!(fills.len(), 1);
+                assert_eq!(fills[0].coin, "xyz:SOXL");
+                assert_eq!(fills[0].oid, 200);
+                assert_eq!(fills[0].tid, 2);
+                assert_eq!(fills[0].side, OrderSide::Buy);
+                assert_eq!(fills[0].price, dec!(33.75));
+                assert_eq!(fills[0].qty, dec!(0.3));
+                assert!(fills[0].is_maker);
+            }
+            other => panic!("Unexpected: {:?}", other),
+        }
+
+        let ord_upd_raw = r#"{
+            "channel": "orderUpdates",
+            "data": [
+                {
+                    "order": {"coin": "HYPE", "side": "A", "limitPx": "47.7", "sz": "35.0", "origSz": "35.0", "oid": 10},
+                    "status": "open",
+                    "statusTimestamp": 1795621352000
+                },
+                {
+                    "order": {"coin": "xyz:SOXL", "side": "A", "limitPx": "33.80", "sz": "0.0", "origSz": "0.3", "oid": 201},
+                    "status": "filled",
+                    "statusTimestamp": 1795621353000
+                }
+            ]
+        }"#;
+        match parse_hl_user_message(ord_upd_raw, "xyz:SOXL").unwrap() {
+            HlUserStreamMsg::OrderUpdates(upds) => {
+                assert_eq!(upds.len(), 1);
+                assert_eq!(upds[0].oid, 201);
+                assert_eq!(upds[0].side, OrderSide::Sell);
+                assert_eq!(upds[0].orig_qty, dec!(0.3));
+                assert_eq!(upds[0].remaining_qty, dec!(0.0));
+                assert_eq!(upds[0].status, "filled");
+            }
+            other => panic!("Unexpected: {:?}", other),
+        }
     }
 }
